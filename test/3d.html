@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Try-On</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b21; --panel-2: #20242c; --text: #e8eaed;
+    --muted: #9aa0a6; --accent: #c9a45c; --border: #2a2e36;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header span { color: var(--muted); font-size: 13px; }
+  header a { margin-left: auto; color: var(--accent); font-size: 13px; text-decoration: none; }
+  main { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; align-items: flex-start; }
+
+  .stage { position: relative; flex: 1 1 560px; min-width: 0; min-height: 320px; background: #000; border-radius: 12px; overflow: hidden; display: flex; justify-content: center; align-items: center; }
+  #view { position: relative; transform: scaleX(-1); }   /* mirror view */
+  #view > * { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #video { object-fit: fill; }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px; align-items: center; justify-content: center; text-align: center; padding: 24px; background: radial-gradient(circle at center, #1b1f27, #0b0c10); }
+  .overlay p { margin: 0; color: var(--muted); max-width: 440px; }
+  .overlay .err { color: #ff8a80; }
+  .hint { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); background: rgba(0,0,0,.7); padding: 6px 14px; border-radius: 999px; font-size: 13px; max-width: calc(100% - 24px); text-align: center; }
+  .fps { position: absolute; top: 8px; left: 10px; font: 12px ui-monospace, monospace; color: #8f8; opacity: .75; }
+  [hidden] { display: none !important; }
+
+  aside { flex: 0 1 300px; width: 100%; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 18px; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+  select { width: 100%; font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+  button { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; cursor: pointer; }
+  button.primary { background: var(--accent); color: #1a1408; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  .big { font-size: 16px; padding: 12px 22px; }
+  .slider { display: grid; grid-template-columns: 56px 1fr; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-top: 6px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .check { display: flex; gap: 8px; align-items: center; color: var(--muted); cursor: pointer; margin-top: 6px; }
+  .small { font-size: 12px; color: var(--muted); margin: 0; }
+  .small a { color: var(--muted); }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<header>
+  <h1>3D Try-On</h1>
+  <span>Real-time 3D clothing, runs entirely in your browser. No video leaves your device.</span>
+  <a href="index.html">2D version →</a>
+</header>
+
+<main>
+  <div class="stage">
+    <div id="view">
+      <video id="video" playsinline muted></video>
+      <canvas id="bg" hidden></canvas>
+      <canvas id="gl"></canvas>
+      <canvas id="debugOverlay"></canvas>
+    </div>
+    <div class="overlay" id="overlay">
+      <p>Stand about 1.5–2 m from the camera, facing it, so your shoulders and waist are in frame.</p>
+      <button class="primary big" id="startBtn">Start camera</button>
+      <p id="status"></p>
+    </div>
+    <div class="hint" id="hint" hidden></div>
+    <div class="fps" id="fps" hidden></div>
+  </div>
+
+  <aside>
+    <section>
+      <h2>Outfit</h2>
+      <select id="outfit"></select>
+    </section>
+
+    <section id="cameraSection" hidden>
+      <h2>Camera</h2>
+      <select id="cameraSelect"></select>
+    </section>
+
+    <section>
+      <h2>Fit</h2>
+      <div class="slider">Size <input type="range" id="fit" min="0.8" max="1.25" step="0.01" value="1"></div>
+      <div class="slider">Height <input type="range" id="offset" min="-0.3" max="0.3" step="0.01" value="0"></div>
+    </section>
+
+    <section>
+      <h2>Display</h2>
+      <label class="check"><input type="checkbox" id="autoLight" checked> Match lighting to camera</label>
+      <label class="check"><input type="checkbox" id="skeleton"> Show tracking points</label>
+    </section>
+
+    <button class="primary" id="snapBtn" disabled>Take snapshot</button>
+
+    <p class="small">3D models: <a href="https://github.com/microsoft/Microsoft-Rocketbox" target="_blank" rel="noopener">Microsoft Rocketbox</a> (MIT).</p>
+  </aside>
+</main>
+
+<script type="module" src="js/tryon3d.js"></script>
+</body>
+</html>
