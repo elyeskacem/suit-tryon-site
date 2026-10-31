@@ -10,7 +10,8 @@ const isMobile = /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
 const MODEL_URL = isMobile
   ? "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
   : "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
-const testPose = new URLSearchParams(location.search).get("test");
+const params = new URLSearchParams(location.search);
+const testPose = params.get("test");
 
 const $ = s => document.querySelector(s);
 const video = $("#video"), bg = $("#bg"), glCanvas = $("#gl"), dbg = $("#debugOverlay"), view = $("#view");
@@ -73,7 +74,8 @@ async function setOutfit(id) {
     outfitSelect.disabled = false;
   }
 }
-const avatarReady = setOutfit(OUTFITS[0].id).catch(err => {
+outfitSelect.value = OUTFITS.some(o => o.id === params.get("outfit")) ? params.get("outfit") : OUTFITS[0].id;
+const avatarReady = setOutfit(outfitSelect.value).catch(err => {
   console.error(err);
   statusEl.className = "err";
   statusEl.textContent = `Could not load the 3D outfit: ${err.message || err}`;
@@ -303,4 +305,4 @@ window.tryon = { get pose() { return pose; }, get avatar() { return avatar; }, s
 
 $("#startBtn").onclick = () => startCamera({ profile: retryProfile });
 if (testPose) startTest();
-else if (new URLSearchParams(location.search).has("autostart")) startCamera();
+else if (params.has("autostart")) startCamera();

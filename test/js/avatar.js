@@ -1,10 +1,20 @@
 import * as THREE from "three";
 import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
-// Each outfit is a Rocketbox avatar folder: model.fbx + body_color/normal/roughness textures.
+// An outfit is either a Rocketbox avatar folder (model.fbx + body_color/normal/roughness textures)
+// or a static .glb garment. Garments are fitted to the BODY avatar in Blender
+// (blender/denyx_garments.blend) and skinned to its skeleton when they load; that body follows
+// the person but is not drawn. A garment with a `bone` rides on that bone rigidly; any other
+// bends with the body under it.
 export const OUTFITS = [
   { id: "male_adult_07", name: "Grey blazer, shirt & jeans", path: "assets/avatars/male_adult_07/" },
+  { id: "denyx_apron", name: "DENYX apron", garment: "assets/garments/denyx_apron.glb" },
+  { id: "denyx_badge", name: "DENYX lanyard badge", garment: "assets/garments/denyx_badge.glb", bone: "spine2" },
 ];
+const BODY = "assets/avatars/male_adult_07/";
+// Garments are in meters; the Rocketbox FBX is in centimeters.
+const BODY_UNITS_PER_METER = 100;
 
 // 3ds Max Biped bone names, shared by every Rocketbox avatar.
 const BONE_PATTERNS = {
@@ -18,6 +28,8 @@ const BONE_PATTERNS = {
 
 // Vertices driven by these bones are not drawn, so the user's real hands show through.
 const HIDDEN_BONES = /hand|finger/i;
+// Under a garment the whole body occludes: it hides the garment's back, and arms in front of it.
+const ALL_BONES = /./;
 
 // MediaPipe pose landmark indices. "Left" is the person's left.
 const LM = {
@@ -27,37 +39,55 @@ const LM = {
 };
 
 export async function loadAvatar(outfit) {
-  const fbx = await new FBXLoader().loadAsync(outfit.path + "model.fbx");
-  const texLoader = new THREE.TextureLoader();
-  const tex = async (file, isColor) => {
-    const t = await texLoader.loadAsync(outfit.path + file);
-    if (isColor) t.colorSpace = THREE.SRGBColorSpace;
-    t.anisotropy = 8;
-    return t;
-  };
-  const [map, normalMap, roughnessMap] = await Promise.all([
-    tex("body_color.jpg", true), tex("body_normal.jpg"), tex("body_roughness.jpg"),
+  if (!outfit.garment) {
+    const { root, meshes } = await loadRocketbox(outfit.path, { textured: true, occlude: HIDDEN_BONES });
+    return new Avatar(root, meshes[0].skeleton);
+  }
+  const [body, gltf] = await Promise.all([
+    loadRocketbox(BODY, { textured: false, occlude: ALL_BONES }),
+    new GLTFLoader().loadAsync(outfit.garment),
   ]);
+  const avatar = new Avatar(body.root, body.meshes[0].skeleton);
+  dress(avatar, body.meshes, gltf.scene, outfit);
+  return avatar;
+}
 
-  const clothes = new THREE.MeshStandardMaterial({ map, normalMap, roughnessMap, roughness: 1, metalness: 0 });
-  maskByBones(clothes, "drop");
-  const occludeHands = new THREE.MeshBasicMaterial({ colorWrite: false });
-  maskByBones(occludeHands, "keep");
-  const occludeHead = new THREE.MeshBasicMaterial({ colorWrite: false });
+// With `textured`, the avatar's clothes are drawn, except where the `occlude` bones drive them.
+// Without, nothing is drawn. Either way the head and the `occlude` bones are rendered depth-only.
+async function loadRocketbox(path, { textured, occlude }) {
+  const fbx = await new FBXLoader().loadAsync(path + "model.fbx");
   const hidden = new THREE.MeshBasicMaterial({ visible: false });
+  let clothes = hidden;
+  if (textured) {
+    const texLoader = new THREE.TextureLoader();
+    const tex = async (file, isColor) => {
+      const t = await texLoader.loadAsync(path + file);
+      if (isColor) t.colorSpace = THREE.SRGBColorSpace;
+      t.anisotropy = 8;
+      return t;
+    };
+    const [map, normalMap, roughnessMap] = await Promise.all([
+      tex("body_color.jpg", true), tex("body_normal.jpg"), tex("body_roughness.jpg"),
+    ]);
+    clothes = new THREE.MeshStandardMaterial({ map, normalMap, roughnessMap, roughness: 1, metalness: 0 });
+    maskByBones(clothes, "drop");
+  }
+  const occludeBones = new THREE.MeshBasicMaterial({ colorWrite: false });
+  maskByBones(occludeBones, "keep");
+  const occludeHead = new THREE.MeshBasicMaterial({ colorWrite: false });
 
   const meshes = [];
   fbx.traverse(o => { if (o.isSkinnedMesh) meshes.push(o); });
-  if (!meshes.length) throw new Error(`No skinned mesh in ${outfit.id}`);
+  if (!meshes.length) throw new Error(`No skinned mesh in ${path}`);
 
   for (const mesh of meshes) {
     const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    addHiddenAttribute(mesh);
+    addHiddenAttribute(mesh, occlude);
     // Head, neck and hair are never drawn, but the head is rendered depth-only (an invisible
     // occluder) so the user's real neck hides the back of the collar. Same for the hands.
     mesh.material = mats.map(m => /head|opacity/i.test(m.name) ? hidden : clothes);
     const occluder = new THREE.SkinnedMesh(mesh.geometry,
-      mats.map(m => /head/i.test(m.name) ? occludeHead : /opacity/i.test(m.name) ? hidden : occludeHands));
+      mats.map(m => /head/i.test(m.name) ? occludeHead : /opacity/i.test(m.name) ? hidden : occludeBones));
     occluder.position.copy(mesh.position);
     occluder.quaternion.copy(mesh.quaternion);
     occluder.scale.copy(mesh.scale);
@@ -66,15 +96,14 @@ export async function loadAvatar(outfit) {
     mesh.parent.add(occluder);
     mesh.frustumCulled = occluder.frustumCulled = false;
   }
-
-  return new Avatar(fbx, meshes[0].skeleton);
+  return { root: fbx, meshes };
 }
 
-function addHiddenAttribute(mesh) {
+function addHiddenAttribute(mesh, bones) {
   const geo = mesh.geometry;
   if (geo.attributes.aHidden) return;
   const hiddenIdx = new Set();
-  mesh.skeleton.bones.forEach((b, i) => { if (HIDDEN_BONES.test(b.name)) hiddenIdx.add(i); });
+  mesh.skeleton.bones.forEach((b, i) => { if (bones.test(b.name)) hiddenIdx.add(i); });
   const si = geo.attributes.skinIndex, sw = geo.attributes.skinWeight;
   const out = new Float32Array(si.count);
   for (let v = 0; v < si.count; v++) {
@@ -96,6 +125,92 @@ function maskByBones(material, mode) {
       .replace("void main() {", `void main() {\n\tif (vHidden ${mode === "drop" ? ">" : "<"} 0.5) discard;`);
   };
   material.customProgramCacheKey = () => `bonemask-${mode}`;
+}
+
+// ---------- Garments ----------
+// Skin a garment, already fitted to the body's rest pose, to the avatar's skeleton. The avatar's
+// root is still at the origin here, so world space is the body's own space.
+function dress(avatar, meshes, garment, outfit) {
+  const bones = meshes[0].skeleton.bones;
+  let weightsAt;
+  if (outfit.bone) {
+    const rigid = [[bones.indexOf(avatar.bones[outfit.bone]), 1]];
+    weightsAt = () => rigid;
+  } else {
+    weightsAt = nearestWeights(bodyVertices(meshes), 0.04 * BODY_UNITS_PER_METER);
+  }
+
+  const toBody = new THREE.Matrix4().makeScale(BODY_UNITS_PER_METER, BODY_UNITS_PER_METER, BODY_UNITS_PER_METER);
+  const parts = [];
+  garment.updateMatrixWorld(true);
+  garment.traverse(o => { if (o.isMesh) parts.push(o); });
+  const skeleton = new THREE.Skeleton(bones);   // bound in the rest pose
+  for (const part of parts) {
+    const geometry = part.geometry.clone().applyMatrix4(toBody.clone().multiply(part.matrixWorld));
+    setSkin(geometry, weightsAt);
+    const mesh = new THREE.SkinnedMesh(geometry, part.material);
+    mesh.name = part.name;
+    mesh.bind(skeleton, new THREE.Matrix4());
+    mesh.frustumCulled = false;
+    avatar.root.add(mesh);
+  }
+}
+
+// The body's vertices in the rest pose, with their skin weights, without duplicates.
+function bodyVertices(meshes) {
+  const out = [], seen = new Set();
+  for (const mesh of meshes) {
+    const { position, skinIndex, skinWeight } = mesh.geometry.attributes;
+    for (let i = 0; i < position.count; i++) {
+      const p = mesh.localToWorld(mesh.getVertexPosition(i, new THREE.Vector3()));
+      const id = `${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const skin = [];
+      for (let k = 0; k < 4; k++) if (skinWeight.getComponent(i, k) > 0) skin.push([skinIndex.getComponent(i, k), skinWeight.getComponent(i, k)]);
+      out.push({ p, skin });
+    }
+  }
+  return out;
+}
+
+// Skin weights at a point: the nearest body vertices' weights, blended by inverse squared distance.
+function nearestWeights(body, cell, k = 6) {
+  const grid = new Map(), c = q => Math.floor(q / cell), key = (x, y, z) => `${x},${y},${z}`;
+  for (const v of body) {
+    const id = key(c(v.p.x), c(v.p.y), c(v.p.z));
+    if (!grid.has(id)) grid.set(id, []);
+    grid.get(id).push(v);
+  }
+  return p => {
+    // Search shells of grid cells outward until k vertices are found, plus one shell for nearer ones.
+    const x0 = c(p.x), y0 = c(p.y), z0 = c(p.z), found = [];
+    for (let r = 0, last = Infinity; r <= last; r++) {
+      for (let x = -r; x <= r; x++) for (let y = -r; y <= r; y++) for (let z = -r; z <= r; z++) {
+        if (Math.max(Math.abs(x), Math.abs(y), Math.abs(z)) !== r) continue;
+        for (const v of grid.get(key(x0 + x, y0 + y, z0 + z)) ?? []) found.push([v, v.p.distanceToSquared(p)]);
+      }
+      if (last === Infinity && found.length >= k) last = r + 1;
+    }
+    const acc = new Map();
+    for (const [v, d2] of found.sort((a, b) => a[1] - b[1]).slice(0, k)) {
+      const w = 1 / (d2 + cell * cell * 1e-4);
+      for (const [bone, x] of v.skin) acc.set(bone, (acc.get(bone) ?? 0) + w * x);
+    }
+    const top = [...acc].sort((a, b) => b[1] - a[1]).slice(0, 4);
+    const sum = top.reduce((t, [, x]) => t + x, 0);
+    return top.map(([bone, x]) => [bone, x / sum]);
+  };
+}
+
+function setSkin(geometry, weightsAt) {
+  const pos = geometry.attributes.position, p = new THREE.Vector3();
+  const index = new Uint16Array(pos.count * 4), weight = new Float32Array(pos.count * 4);
+  for (let i = 0; i < pos.count; i++) {
+    weightsAt(p.fromBufferAttribute(pos, i)).forEach(([bone, w], k) => { index[i * 4 + k] = bone; weight[i * 4 + k] = w; });
+  }
+  geometry.setAttribute("skinIndex", new THREE.Uint16BufferAttribute(index, 4));
+  geometry.setAttribute("skinWeight", new THREE.Float32BufferAttribute(weight, 4));
 }
 
 // ---------- Retargeting ----------
