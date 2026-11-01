@@ -15,7 +15,7 @@ const testPose = params.get("test");
 
 const $ = s => document.querySelector(s);
 const video = $("#video"), bg = $("#bg"), glCanvas = $("#gl"), dbg = $("#debugOverlay"), view = $("#view");
-const overlay = $("#overlay"), statusEl = $("#status"), hintEl = $("#hint"), fpsEl = $("#fps");
+const stage = $("#stage"), overlay = $("#overlay"), statusEl = $("#status"), hintEl = $("#hint"), fpsEl = $("#fps");
 
 const settings = { fit: 1, offset: 0, autoLight: true, skeleton: !!testPose };
 
@@ -49,7 +49,7 @@ function resize(w, h) {
   fitView();
 }
 function fitView() {
-  const maxW = view.parentElement.clientWidth, maxH = window.innerHeight * 0.8;
+  const maxW = stage.clientWidth, maxH = stage.clientHeight;
   const s = Math.min(maxW / W, maxH / H);
   view.style.width = `${Math.floor(W * s)}px`;
   view.style.height = `${Math.floor(H * s)}px`;
@@ -58,12 +58,29 @@ window.addEventListener("resize", fitView);
 resize(W, H);
 
 // ---------- Outfit ----------
+// Only the DENYX garments are offered; each gets a card with a thumbnail from assets/ui/.
+const CHOICES = OUTFITS.filter(o => o.garment);
+const CARD_TEXT = { denyx_apron: ["Apron", "Denim bib apron"], denyx_badge: ["Badge", "Lanyard & card holder"] };
+const outfitCards = CHOICES.map(o => {
+  const [name, note] = CARD_TEXT[o.id] ?? [o.name, ""];
+  const card = document.createElement("button");
+  card.className = "outfit";
+  card.dataset.id = o.id;
+  card.setAttribute("role", "radio");
+  card.innerHTML = `<span class="thumb"><img src="assets/ui/${o.id}.png" alt=""></span><span><b>${name}</b><small>${note}</small></span>`;
+  card.onclick = () => { if (card.getAttribute("aria-checked") !== "true") setOutfit(o.id); };
+  return card;
+});
+$("#outfits").append(...outfitCards);
+
 let avatar = null;
-const outfitSelect = $("#outfit");
-for (const o of OUTFITS) outfitSelect.add(new Option(o.name, o.id));
 async function setOutfit(id) {
   const outfit = OUTFITS.find(o => o.id === id);
-  outfitSelect.disabled = true;
+  for (const card of outfitCards) {
+    card.disabled = true;
+    card.setAttribute("aria-checked", card.dataset.id === id);
+    card.classList.toggle("loading", card.dataset.id === id);
+  }
   try {
     const next = await loadAvatar(outfit);
     if (avatar) scene.remove(avatar.root);
@@ -71,16 +88,15 @@ async function setOutfit(id) {
     avatar.root.visible = false;
     scene.add(avatar.root);
   } finally {
-    outfitSelect.disabled = false;
+    for (const card of outfitCards) { card.disabled = false; card.classList.remove("loading"); }
   }
 }
-outfitSelect.value = OUTFITS.some(o => o.id === params.get("outfit")) ? params.get("outfit") : OUTFITS[0].id;
-const avatarReady = setOutfit(outfitSelect.value).catch(err => {
+const firstOutfit = CHOICES.some(o => o.id === params.get("outfit")) ? params.get("outfit") : CHOICES[0].id;
+const avatarReady = setOutfit(firstOutfit).catch(err => {
   console.error(err);
   statusEl.className = "err";
   statusEl.textContent = `Could not load the 3D outfit: ${err.message || err}`;
 });
-outfitSelect.onchange = e => setOutfit(e.target.value);
 
 // ---------- Controls ----------
 $("#fit").oninput = e => settings.fit = +e.target.value;
@@ -91,7 +107,28 @@ $("#autoLight").onchange = e => {
 };
 $("#skeleton").checked = settings.skeleton;
 $("#skeleton").onchange = e => settings.skeleton = e.target.checked;
+$("#resetFit").onclick = () => {
+  for (const [id, value] of [["fit", 1], ["offset", 0]]) {
+    $("#" + id).value = value;
+    $("#" + id).dispatchEvent(new Event("input"));
+  }
+};
+
+// Settings drawer.
+const panel = $("#panel"), scrim = $("#scrim"), settingsBtn = $("#settingsBtn");
+function showPanel(open) {
+  panel.classList.toggle("open", open);
+  scrim.hidden = !open;
+  settingsBtn.setAttribute("aria-expanded", open);
+}
+settingsBtn.onclick = () => showPanel(!panel.classList.contains("open"));
+$("#closePanel").onclick = scrim.onclick = () => showPanel(false);
+window.addEventListener("keydown", e => { if (e.key === "Escape") showPanel(false); });
+
 $("#snapBtn").onclick = () => {
+  stage.classList.remove("flash");
+  void stage.offsetWidth;   // restart the flash animation
+  stage.classList.add("flash");
   const out = document.createElement("canvas");
   out.width = W; out.height = H;
   const c = out.getContext("2d");
