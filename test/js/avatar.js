@@ -3,16 +3,18 @@ import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // An outfit is either a Rocketbox avatar folder (model.fbx + body_color/normal/roughness textures)
-// or a static .glb garment. Garments are fitted to the BODY avatar in Blender
-// (blender/denyx_garments.blend) and skinned to its skeleton when they load; that body follows
-// the person but is not drawn. A garment with a `bone` rides on that bone rigidly; any other
-// bends with the body under it.
+// or a static .glb garment. Garments are fitted in Blender (blender/denyx_garments.blend) to
+// GARMENT_BODY, the AVATAR in a T-shirt, and skinned to the avatar's skeleton when they load. The
+// avatar follows the person but is not drawn; GARMENT_BODY and its head are drawn depth-only, so
+// they hide what is behind the person (the back of a garment, a lanyard behind the neck). A garment
+// with a `bone` rides on that bone rigidly; any other bends with the body under it.
 export const OUTFITS = [
   { id: "male_adult_07", name: "Grey blazer, shirt & jeans", path: "assets/avatars/male_adult_07/" },
   { id: "denyx_apron", name: "DENYX apron", garment: "assets/garments/denyx_apron.glb" },
   { id: "denyx_badge", name: "DENYX lanyard badge", garment: "assets/garments/denyx_badge.glb", bone: "spine2" },
 ];
-const BODY = "assets/avatars/male_adult_07/";
+const AVATAR = "assets/avatars/male_adult_07/";
+const GARMENT_BODY = "assets/garments/body.glb";
 // Garments are in meters; the Rocketbox FBX is in centimeters.
 const BODY_UNITS_PER_METER = 100;
 
@@ -28,8 +30,6 @@ const BONE_PATTERNS = {
 
 // Vertices driven by these bones are not drawn, so the user's real hands show through.
 const HIDDEN_BONES = /hand|finger/i;
-// Under a garment the whole body occludes: it hides the garment's back, and arms in front of it.
-const ALL_BONES = /./;
 
 // MediaPipe pose landmark indices. "Left" is the person's left.
 const LM = {
@@ -43,17 +43,24 @@ export async function loadAvatar(outfit) {
     const { root, meshes } = await loadRocketbox(outfit.path, { textured: true, occlude: HIDDEN_BONES });
     return new Avatar(root, meshes[0].skeleton);
   }
-  const [body, gltf] = await Promise.all([
-    loadRocketbox(BODY, { textured: false, occlude: ALL_BONES }),
-    new GLTFLoader().loadAsync(outfit.garment),
+  const gltf = new GLTFLoader();
+  const [{ root, meshes }, garment, body] = await Promise.all([
+    loadRocketbox(AVATAR, { textured: false }),
+    gltf.loadAsync(outfit.garment),
+    gltf.loadAsync(GARMENT_BODY),
   ]);
-  const avatar = new Avatar(body.root, body.meshes[0].skeleton);
-  dress(avatar, body.meshes, gltf.scene, outfit);
+  const avatar = new Avatar(root, meshes[0].skeleton);
+  const skeleton = new THREE.Skeleton(meshes[0].skeleton.bones);   // bound in the rest pose
+  const nearest = nearestWeights(bodyVertices(meshes), 0.04 * BODY_UNITS_PER_METER);
+  dress(avatar, skeleton, body.scene, nearest, new THREE.MeshBasicMaterial({ colorWrite: false }));
+  const rigid = outfit.bone && [[skeleton.bones.indexOf(avatar.bones[outfit.bone]), 1]];
+  dress(avatar, skeleton, garment.scene, rigid ? () => rigid : nearest);
   return avatar;
 }
 
 // With `textured`, the avatar's clothes are drawn, except where the `occlude` bones drive them.
-// Without, nothing is drawn. Either way the head and the `occlude` bones are rendered depth-only.
+// Without, nothing is drawn. Either way the head, and the `occlude` bones if any, are rendered
+// depth-only.
 async function loadRocketbox(path, { textured, occlude }) {
   const fbx = await new FBXLoader().loadAsync(path + "model.fbx");
   const hidden = new THREE.MeshBasicMaterial({ visible: false });
@@ -82,12 +89,12 @@ async function loadRocketbox(path, { textured, occlude }) {
 
   for (const mesh of meshes) {
     const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    addHiddenAttribute(mesh, occlude);
+    if (occlude) addHiddenAttribute(mesh, occlude);
     // Head, neck and hair are never drawn, but the head is rendered depth-only (an invisible
     // occluder) so the user's real neck hides the back of the collar. Same for the hands.
     mesh.material = mats.map(m => /head|opacity/i.test(m.name) ? hidden : clothes);
     const occluder = new THREE.SkinnedMesh(mesh.geometry,
-      mats.map(m => /head/i.test(m.name) ? occludeHead : /opacity/i.test(m.name) ? hidden : occludeBones));
+      mats.map(m => /head/i.test(m.name) ? occludeHead : /opacity/i.test(m.name) || !occlude ? hidden : occludeBones));
     occluder.position.copy(mesh.position);
     occluder.quaternion.copy(mesh.quaternion);
     occluder.scale.copy(mesh.scale);
@@ -128,32 +135,34 @@ function maskByBones(material, mode) {
 }
 
 // ---------- Garments ----------
-// Skin a garment, already fitted to the body's rest pose, to the avatar's skeleton. The avatar's
-// root is still at the origin here, so world space is the body's own space.
-function dress(avatar, meshes, garment, outfit) {
-  const bones = meshes[0].skeleton.bones;
-  let weightsAt;
-  if (outfit.bone) {
-    const rigid = [[bones.indexOf(avatar.bones[outfit.bone]), 1]];
-    weightsAt = () => rigid;
-  } else {
-    weightsAt = nearestWeights(bodyVertices(meshes), 0.04 * BODY_UNITS_PER_METER);
-  }
-
+// Skin a model fitted to the body's rest pose (a garment, or with an `occluder` material the
+// garment body) to the avatar's skeleton. The avatar's root is still at the origin here, so world
+// space is the body's own space.
+function dress(avatar, skeleton, scene, weightsAt, occluder) {
   const toBody = new THREE.Matrix4().makeScale(BODY_UNITS_PER_METER, BODY_UNITS_PER_METER, BODY_UNITS_PER_METER);
   const parts = [];
-  garment.updateMatrixWorld(true);
-  garment.traverse(o => { if (o.isMesh) parts.push(o); });
-  const skeleton = new THREE.Skeleton(bones);   // bound in the rest pose
+  scene.updateMatrixWorld(true);
+  scene.traverse(o => { if (o.isMesh) parts.push(o); });
   for (const part of parts) {
     const geometry = part.geometry.clone().applyMatrix4(toBody.clone().multiply(part.matrixWorld));
+    // The view is mirrored, so prints are too, or they would read backwards.
+    if (!occluder && part.material.map) mirrorPrint(geometry);
     setSkin(geometry, weightsAt);
-    const mesh = new THREE.SkinnedMesh(geometry, part.material);
+    const mesh = new THREE.SkinnedMesh(geometry, occluder ?? part.material);
     mesh.name = part.name;
     mesh.bind(skeleton, new THREE.Matrix4());
     mesh.frustumCulled = false;
+    if (occluder) mesh.renderOrder = -1;    // write depth before the garment is drawn
     avatar.root.add(mesh);
   }
+}
+
+// Flip a texture left to right on its part of the model.
+function mirrorPrint(geometry) {
+  const uv = geometry.attributes.uv;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < uv.count; i++) { lo = Math.min(lo, uv.getX(i)); hi = Math.max(hi, uv.getX(i)); }
+  for (let i = 0; i < uv.count; i++) uv.setX(i, lo + hi - uv.getX(i));
 }
 
 // The body's vertices in the rest pose, with their skin weights, without duplicates.
