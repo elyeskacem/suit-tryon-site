@@ -2,44 +2,196 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>3D Try-On</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1020">
+<title>DENYX · Virtual Fitting Room</title>
 <style>
   :root {
-    --bg: #0f1115; --panel: #181b21; --panel-2: #20242c; --text: #e8eaed;
-    --muted: #9aa0a6; --accent: #c9a45c; --border: #2a2e36;
+    --ink: #0b1020; --panel: #141b30; --panel-2: #1c2541; --line: rgba(255,255,255,.09);
+    --text: #eef1f8; --muted: #9aa6c2; --denim: #6c8fd0; --stitch: #f0b84d; --stitch-ink: #2a1d05;
+    --danger: #ff8a80; --radius: 20px;
+    /* Denim twill: fine diagonal weave, used on the background surfaces. */
+    --twill: repeating-linear-gradient(135deg, rgba(108,143,208,.06) 0 2px, transparent 2px 6px);
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  header { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-  header h1 { font-size: 18px; margin: 0; }
-  header span { color: var(--muted); font-size: 13px; }
-  header a { margin-left: auto; color: var(--accent); font-size: 13px; text-decoration: none; }
-  main { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; align-items: flex-start; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; height: 100dvh; overflow: hidden; color: var(--text);
+    background: var(--twill), radial-gradient(120% 80% at 50% 0%, #17203a, var(--ink) 70%);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+  [hidden] { display: none !important; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  button:disabled { cursor: default; }
+  :focus-visible { outline: 2px solid var(--stitch); outline-offset: 3px; }
 
-  .stage { position: relative; flex: 1 1 560px; min-width: 0; min-height: 320px; background: #000; border-radius: 12px; overflow: hidden; display: flex; justify-content: center; align-items: center; }
+  /* ---------- Top bar ---------- */
+  .topbar { display: flex; align-items: center; gap: 14px; padding: max(14px, env(safe-area-inset-top)) 22px 14px; }
+  .logo { font-weight: 900; font-size: 22px; letter-spacing: .14em; line-height: 1; }
+  .sep { width: 1px; height: 20px; background: var(--line); }
+  .title { color: var(--muted); font-size: 14px; letter-spacing: .02em; }
+  .pill {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px;
+    border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 12.5px; background: rgba(20,27,48,.6);
+  }
+  .pill svg { width: 14px; height: 14px; color: var(--stitch); }
+
+  /* ---------- Stage ---------- */
+  .stage {
+    position: relative; margin: 0 16px; border-radius: var(--radius); overflow: hidden;
+    background: #05070d; border: 1px solid var(--line);
+    display: flex; justify-content: center; align-items: center;
+  }
   #view { position: relative; transform: scaleX(-1); }   /* mirror view */
   #view > * { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   #video { object-fit: fill; }
-  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px; align-items: center; justify-content: center; text-align: center; padding: 24px; background: radial-gradient(circle at center, #1b1f27, #0b0c10); }
-  .overlay p { margin: 0; color: var(--muted); max-width: 440px; }
-  .overlay .err { color: #ff8a80; }
-  .hint { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); background: rgba(0,0,0,.7); padding: 6px 14px; border-radius: 999px; font-size: 13px; max-width: calc(100% - 24px); text-align: center; }
-  .fps { position: absolute; top: 8px; left: 10px; font: 12px ui-monospace, monospace; color: #8f8; opacity: .75; }
-  [hidden] { display: none !important; }
+  .stage::after { content: ""; position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+  .stage.flash::after { animation: flash .45s ease-out; }
+  @keyframes flash { from { opacity: .75; } to { opacity: 0; } }
 
-  aside { flex: 0 1 300px; width: 100%; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 18px; }
-  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
-  select { width: 100%; font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
-  button { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; cursor: pointer; }
-  button.primary { background: var(--accent); color: #1a1408; border-color: var(--accent); font-weight: 600; }
-  button:disabled { opacity: .45; cursor: default; }
-  .big { font-size: 16px; padding: 12px 22px; }
-  .slider { display: grid; grid-template-columns: 56px 1fr; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-top: 6px; }
-  input[type=range] { width: 100%; accent-color: var(--accent); }
-  .check { display: flex; gap: 8px; align-items: center; color: var(--muted); cursor: pointer; margin-top: 6px; }
-  .small { font-size: 12px; color: var(--muted); margin: 0; }
-  .small a { color: var(--muted); }
+  .hint {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 28px);
+    display: flex; align-items: center; gap: 9px; padding: 8px 16px; border-radius: 999px;
+    background: rgba(11,16,32,.78); backdrop-filter: blur(10px); border: 1px solid var(--line); font-size: 13.5px;
+  }
+  .hint::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--stitch); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .fps { position: absolute; bottom: 10px; left: 12px; font: 11px ui-monospace, monospace; color: var(--muted); opacity: .7; }
+
+  /* ---------- Start / error screen ---------- */
+  .overlay {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 20px; overflow: auto;
+    background: var(--twill), radial-gradient(90% 70% at 50% 30%, #1e2a4d, #0a0e1b);
+  }
+  .welcome { width: 100%; max-width: 440px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .eyebrow { color: var(--stitch); font-size: 12px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; }
+  .welcome h2 { margin: 0; font-size: clamp(28px, 5vw, 38px); line-height: 1.1; font-weight: 800; letter-spacing: -.01em; }
+  .welcome .lead { margin: 0; color: var(--muted); }
+  .tips { list-style: none; margin: 6px 0; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; width: 100%; }
+  .tips li {
+    padding: 14px 8px 12px; border-radius: 14px; background: rgba(20,27,48,.7); border: 1px solid var(--line);
+    display: flex; flex-direction: column; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); line-height: 1.3;
+  }
+  .tips svg { width: 24px; height: 24px; color: var(--denim); }
+  .cta {
+    margin-top: 4px; min-width: 220px; padding: 15px 28px; border: 0; border-radius: 999px;
+    background: var(--stitch); color: var(--stitch-ink); font-size: 16px; font-weight: 700;
+    box-shadow: 0 10px 30px -10px rgba(240,184,77,.6); transition: transform .15s, filter .15s;
+  }
+  .cta:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.05); }
+  .cta:disabled { opacity: .55; box-shadow: none; }
+  #status { margin: 0; min-height: 1.4em; color: var(--muted); font-size: 13.5px; }
+  #status.err { color: var(--danger); }
+  .fineprint { margin: 0; color: var(--muted); font-size: 12px; opacity: .8; }
+
+  /* ---------- Dock ---------- */
+  .dock {
+    display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+    gap: 18px; padding: 14px 16px max(14px, env(safe-area-inset-bottom));
+  }
+  .outfits { grid-area: outfits; display: flex; gap: 10px; }
+  .outfit {
+    position: relative; display: flex; align-items: center; gap: 12px; padding: 7px 18px 7px 7px; text-align: left;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px; transition: border-color .15s, background .15s;
+  }
+  .outfit:hover:not(:disabled) { background: var(--panel-2); }
+  .outfit[aria-checked="true"] { border-color: var(--stitch); background: var(--panel-2); }
+  /* Selected card gets a dashed "stitch" line, like the seams on the garments. */
+  .outfit[aria-checked="true"]::after {
+    content: ""; position: absolute; inset: 4px; border: 1.5px dashed rgba(240,184,77,.55); border-radius: 12px; pointer-events: none;
+  }
+  .thumb {
+    position: relative; flex: none; width: 52px; height: 52px; border-radius: 11px; display: grid; place-items: center;
+    background: linear-gradient(160deg, #eef2fa, #cfd9ec);
+  }
+  .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; padding: 5px; object-fit: contain; }
+  .outfit > span + span { min-width: 0; }
+  .outfit.loading .thumb::after {
+    content: ""; position: absolute; inset: 0; margin: auto; width: 22px; height: 22px; border-radius: 50%;
+    border: 2.5px solid rgba(11,16,32,.2); border-top-color: var(--ink); animation: spin .8s linear infinite;
+  }
+  .outfit.loading img { opacity: .35; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .outfit b { display: block; font-size: 15px; }
+  .outfit small { display: block; color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+  .shutter {
+    grid-area: shutter; width: 70px; height: 70px; border-radius: 50%; padding: 0;
+    border: 4px solid var(--text); background: transparent; display: grid; place-items: center; transition: opacity .15s;
+  }
+  .shutter::before { content: ""; width: 52px; height: 52px; border-radius: 50%; background: var(--stitch); transition: transform .12s; }
+  .shutter:active:not(:disabled)::before { transform: scale(.88); }
+  .shutter:disabled { opacity: .3; }
+
+  .tools { grid-area: tools; }
+  .icon-btn {
+    width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--panel); border: 1px solid var(--line);
+  }
+  .icon-btn:hover { background: var(--panel-2); }
+  .icon-btn svg { width: 22px; height: 22px; }
+
+  /* ---------- Settings drawer ---------- */
+  .scrim { position: fixed; inset: 0; background: rgba(3,5,12,.5); z-index: 10; }
+  .drawer {
+    position: fixed; z-index: 11; top: 0; right: 0; bottom: 0; width: min(360px, 100%);
+    background: var(--panel); border-left: 1px solid var(--line); box-shadow: -20px 0 60px rgba(0,0,0,.4);
+    display: flex; flex-direction: column; transform: translateX(105%); transition: transform .25s ease; visibility: hidden;
+  }
+  .drawer.open { transform: none; visibility: visible; }
+  .drawer header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+  .drawer header h2 { margin: 0; font-size: 17px; }
+  .drawer header .icon-btn { width: 38px; height: 38px; }
+  .drawer .body { flex: 1; overflow: auto; padding: 8px 20px 20px; }
+  .drawer section { padding: 16px 0; border-bottom: 1px solid var(--line); }
+  .drawer section:last-of-type { border-bottom: 0; }
+  .drawer h3 {
+    margin: 0 0 12px; font-size: 11.5px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .link-btn { background: none; border: 0; padding: 0; color: var(--stitch); font-size: 12px; letter-spacing: normal; text-transform: none; font-weight: 600; }
+  .slider { display: grid; grid-template-columns: 64px 1fr; align-items: center; gap: 10px; font-size: 14px; margin-top: 10px; }
+  input[type=range] { width: 100%; accent-color: var(--stitch); }
+  select {
+    width: 100%; font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px;
+  }
+  .switch { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; cursor: pointer; font-size: 14px; }
+  .switch input {
+    appearance: none; flex: none; margin: 0; width: 42px; height: 24px; border-radius: 999px; position: relative; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--line); transition: background .15s;
+  }
+  .switch input::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--muted); transition: transform .15s, background .15s;
+  }
+  .switch input:checked { background: var(--stitch); border-color: var(--stitch); }
+  .switch input:checked::after { transform: translateX(18px); background: var(--ink); }
+  .drawer footer { padding: 14px 20px max(14px, env(safe-area-inset-bottom)); font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
+  .drawer footer a { color: var(--muted); }
+
+  /* ---------- Phones ---------- */
+  @media (max-width: 680px) {
+    .topbar { padding-left: 16px; padding-right: 16px; gap: 10px; }
+    .logo { font-size: 19px; }
+    .title { font-size: 13px; }
+    .pill span { display: none; }
+    .stage { margin: 0 8px; border-radius: 16px; }
+    .tips li { font-size: 11.5px; padding: 12px 6px 10px; }
+    .dock { display: grid; grid-template-columns: 1fr auto 1fr; grid-template-areas: "outfits outfits outfits" ". shutter tools"; gap: 12px; padding-top: 10px; }
+    .outfits { justify-self: stretch; }
+    .tools { justify-self: start; }
+    .outfit { flex: 1; min-width: 0; padding-right: 10px; }
+    .outfit small { overflow: hidden; text-overflow: ellipsis; }
+    .shutter { width: 62px; height: 62px; }
+    .shutter::before { width: 46px; height: 46px; }
+    .drawer {
+      top: auto; left: 0; width: 100%; max-height: 80dvh; border-left: 0; border-top: 1px solid var(--line);
+      border-radius: 20px 20px 0 0; transform: translateY(105%);
+    }
+  }
 </style>
 <script type="importmap">
 {
@@ -51,57 +203,91 @@
 </script>
 </head>
 <body>
-<header>
-  <h1>3D Try-On</h1>
-  <span>Real-time 3D clothing, runs entirely in your browser. No video leaves your device.</span>
-  <a href="index.html">2D version →</a>
+<header class="topbar">
+  <span class="logo">DENYX</span>
+  <span class="sep"></span>
+  <span class="title">Virtual Fitting Room</span>
+  <span class="pill" title="Runs entirely in your browser. No video leaves your device.">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+    <span>On-device · nothing uploaded</span>
+  </span>
 </header>
 
-<main>
-  <div class="stage">
-    <div id="view">
-      <video id="video" playsinline muted></video>
-      <canvas id="bg" hidden></canvas>
-      <canvas id="gl"></canvas>
-      <canvas id="debugOverlay"></canvas>
-    </div>
-    <div class="overlay" id="overlay">
-      <p>Stand about 1.5–2 m from the camera, facing it, so your shoulders and waist are in frame.</p>
-      <button class="primary big" id="startBtn">Start camera</button>
-      <p id="status"></p>
-    </div>
-    <div class="hint" id="hint" hidden></div>
-    <div class="fps" id="fps" hidden></div>
+<main class="stage" id="stage">
+  <div id="view">
+    <video id="video" playsinline muted></video>
+    <canvas id="bg" hidden></canvas>
+    <canvas id="gl"></canvas>
+    <canvas id="debugOverlay"></canvas>
   </div>
 
-  <aside>
+  <div class="overlay" id="overlay">
+    <div class="welcome">
+      <span class="eyebrow">DENYX workwear</span>
+      <h2>Try it on, live.</h2>
+      <p class="lead">Pick the apron or the badge below, then step in front of your camera.</p>
+      <ul class="tips">
+        <li>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18M6 9l-3 3 3 3M18 9l3 3-3 3"/></svg>
+          Stand 1.5–2 m away
+        </li>
+        <li>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.5"/><path d="M5 10h14M12 10v11M8 21l4-6 4 6"/></svg>
+          Shoulders and waist in frame
+        </li>
+        <li>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          Face the camera in good light
+        </li>
+      </ul>
+      <button class="cta" id="startBtn">Start camera</button>
+      <p id="status" role="status"></p>
+      <p class="fineprint">Everything runs in your browser. No video leaves your device.</p>
+    </div>
+  </div>
+
+  <div class="hint" id="hint" role="status" hidden></div>
+  <div class="fps" id="fps" hidden></div>
+</main>
+
+<footer class="dock">
+  <div class="outfits" id="outfits" role="radiogroup" aria-label="Outfit"></div>
+  <button class="shutter" id="snapBtn" title="Take snapshot" aria-label="Take snapshot" disabled></button>
+  <div class="tools">
+    <button class="icon-btn" id="settingsBtn" title="Adjust" aria-label="Adjust fit and display" aria-controls="panel" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>
+    </button>
+  </div>
+</footer>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="panel" aria-label="Adjust">
+  <header>
+    <h2>Adjust</h2>
+    <button class="icon-btn" id="closePanel" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </header>
+  <div class="body">
     <section>
-      <h2>Outfit</h2>
-      <select id="outfit"></select>
+      <h3>Fit <button class="link-btn" id="resetFit">Reset</button></h3>
+      <label class="slider">Size <input type="range" id="fit" min="0.8" max="1.25" step="0.01" value="1"></label>
+      <label class="slider">Height <input type="range" id="offset" min="-0.3" max="0.3" step="0.01" value="0"></label>
     </section>
 
     <section id="cameraSection" hidden>
-      <h2>Camera</h2>
-      <select id="cameraSelect"></select>
+      <h3>Camera</h3>
+      <select id="cameraSelect" aria-label="Camera"></select>
     </section>
 
     <section>
-      <h2>Fit</h2>
-      <div class="slider">Size <input type="range" id="fit" min="0.8" max="1.25" step="0.01" value="1"></div>
-      <div class="slider">Height <input type="range" id="offset" min="-0.3" max="0.3" step="0.01" value="0"></div>
+      <h3>Display</h3>
+      <label class="switch">Match lighting to camera <input type="checkbox" id="autoLight" checked></label>
+      <label class="switch">Show tracking points <input type="checkbox" id="skeleton"></label>
     </section>
-
-    <section>
-      <h2>Display</h2>
-      <label class="check"><input type="checkbox" id="autoLight" checked> Match lighting to camera</label>
-      <label class="check"><input type="checkbox" id="skeleton"> Show tracking points</label>
-    </section>
-
-    <button class="primary" id="snapBtn" disabled>Take snapshot</button>
-
-    <p class="small">3D models: <a href="https://github.com/microsoft/Microsoft-Rocketbox" target="_blank" rel="noopener">Microsoft Rocketbox</a> (MIT).</p>
-  </aside>
-</main>
+  </div>
+  <footer>3D body model: <a href="https://github.com/microsoft/Microsoft-Rocketbox" target="_blank" rel="noopener">Microsoft Rocketbox</a> (MIT).</footer>
+</aside>
 
 <script type="module" src="js/tryon3d.js"></script>
 </body>
