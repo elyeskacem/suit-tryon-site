@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
-import { OUTFITS, loadAvatar } from "./avatar.js";
+import { OUTFITS, FILM, loadAvatar } from "./avatar.js";
 import { syntheticPose } from "./pose-test.js";
 import { Webcam, PROFILES, listCameras, describeProblem, describeStartError } from "./camera.js";
 
@@ -24,12 +24,22 @@ const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, alpha: true, antial
 renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
-scene.environmentIntensity = 0.6;
-const hemi = new THREE.HemisphereLight(0xffffff, 0x3a3a3a, 1.3);
-const key = new THREE.DirectionalLight(0xffffff, 1.8);
+// A studio for metal and glass to reflect. Fabric doesn't reflect it (see garmentMaterial).
+const envMap = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+// Soft light from above, as indoors: a sky/ground fill and a key light from above the camera,
+// which also casts the garment's shadow on the person. Their color follows the camera image, and
+// the exposure makes a garment as bright as the scene's light would (see matchLighting).
+const KEY_DIR = new THREE.Vector3(0, 0.75, 0.66).normalize();
+const KEY = 1.2, SKY = 1, GROUND = 0.3;
+const FRONT_IRRADIANCE = KEY * KEY_DIR.z + (SKY + GROUND) / 2;   // on a surface facing the camera
+const hemi = new THREE.HemisphereLight(0xffffff, 0xffffff, SKY);
+const key = new THREE.DirectionalLight(0xffffff, KEY);
+key.castShadow = true;
+key.shadow.mapSize.setScalar(isMobile ? 1024 : 2048);
 scene.add(hemi, key, key.target);
 
 // Orthographic camera in camera-image pixels: x right, y up (so y = -pixelRow).
@@ -45,7 +55,10 @@ function resize(w, h) {
   camera.right = W; camera.bottom = -H;
   camera.updateProjectionMatrix();
   key.target.position.set(W / 2, -H / 2, 0);
-  key.position.set(W * 0.75, H * 0.1, 1500);
+  key.position.copy(key.target.position).addScaledVector(KEY_DIR, 3000);
+  const shadowCam = key.shadow.camera, half = Math.max(W, H) * 0.75;
+  Object.assign(shadowCam, { left: -half, right: half, top: half, bottom: -half, near: 100, far: 6000 });
+  shadowCam.updateProjectionMatrix();
   fitView();
 }
 function fitView() {
@@ -82,7 +95,7 @@ async function setOutfit(id) {
     card.classList.toggle("loading", card.dataset.id === id);
   }
   try {
-    const next = await loadAvatar(outfit);
+    const next = await loadAvatar(outfit, { envMap });
     if (avatar) scene.remove(avatar.root);
     avatar = next;
     avatar.root.visible = false;
@@ -103,7 +116,7 @@ $("#fit").oninput = e => settings.fit = +e.target.value;
 $("#offset").oninput = e => settings.offset = +e.target.value;
 $("#autoLight").onchange = e => {
   settings.autoLight = e.target.checked;
-  if (!settings.autoLight) { renderer.toneMappingExposure = 1; hemi.color.set(0xffffff); key.color.set(0xffffff); }
+  if (!settings.autoLight) setLighting(NEUTRAL_LIGHT, white);
 };
 $("#skeleton").checked = settings.skeleton;
 $("#skeleton").onchange = e => settings.skeleton = e.target.checked;
@@ -181,26 +194,63 @@ function updatePose(result) {
 }
 
 // ---------- Lighting from the camera image ----------
+// A garment of albedo a, facing the camera, should come out about a * lightLevel bright (linear),
+// as bright as the person's real clothes of that color: rendered brighter, it glowed like a
+// sticker. A camera exposes for its scene, so the image's mean brightness says roughly how
+// strongly the scene is lit. Dark clothes and dark rooms make that too low, so the face sets a
+// floor: skin reflects at most about 45% of the light, so the light on the person is at least the
+// face's brightness / 0.45. Whatever the skin tone, that floor is at most the real light, so it
+// only corrects scenes darker on average than the light on the person. The light also takes on
+// the image's color cast.
 const probe = document.createElement("canvas");
 probe.width = 24; probe.height = 14;
 const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+const faceProbe = document.createElement("canvas");
+faceProbe.width = faceProbe.height = 12;
+const faceCtx = faceProbe.getContext("2d", { willReadFrequently: true });
+const LINEAR = Array.from({ length: 256 }, (_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; });
+const NEUTRAL_LIGHT = 0.45;
 const tint = new THREE.Color(), white = new THREE.Color(0xffffff);
-let exposure = 1;
+let lightLevel = NEUTRAL_LIGHT;
+
+function setLighting(level, color) {
+  renderer.toneMappingExposure = level * Math.PI / FRONT_IRRADIANCE;
+  FILM.grain.value = THREE.MathUtils.clamp(0.012 * Math.sqrt(NEUTRAL_LIGHT / level), 0.008, 0.03);   // dim scenes are grainier
+  hemi.color.copy(color);
+  hemi.groundColor.copy(color).multiplyScalar(GROUND / SKY);
+  key.color.copy(color);
+}
+
+// The light on the face, from the skin between the eyes and the nose (its bright part, so
+// glasses, eyes and beard don't count); 0 if the face isn't clearly in view.
+function faceLight(src) {
+  if (!pose || [0, 2, 5].some(i => pose.vis[i] < 0.5)) return 0;
+  const a = pose.img[2], b = pose.img[5], nose = pose.img[0];
+  const x = Math.min(a.x, b.x), y = -Math.max(a.y, b.y), w = Math.abs(a.x - b.x), h = -nose.y - y;
+  if (w < 6 || h < 4) return 0;
+  faceCtx.drawImage(src, x, y, w, h, 0, 0, faceProbe.width, faceProbe.height);
+  const d = faceCtx.getImageData(0, 0, faceProbe.width, faceProbe.height).data;
+  const lum = [];
+  for (let i = 0; i < d.length; i += 4) lum.push(0.2126 * LINEAR[d[i]] + 0.7152 * LINEAR[d[i + 1]] + 0.0722 * LINEAR[d[i + 2]]);
+  lum.sort((p, q) => p - q);
+  return lum[Math.floor(lum.length * 0.75)] / 0.45;
+}
+
 function matchLighting(src) {
   probeCtx.drawImage(src, 0, 0, probe.width, probe.height);
   const d = probeCtx.getImageData(0, 0, probe.width, probe.height).data;
   let r = 0, g = 0, b = 0;
-  for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
-  const n = (d.length / 4) * 255;
+  for (let i = 0; i < d.length; i += 4) { r += LINEAR[d[i]]; g += LINEAR[d[i + 1]]; b += LINEAR[d[i + 2]]; }
+  const n = d.length / 4;
   r /= n; g /= n; b /= n;
   const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  exposure += (THREE.MathUtils.clamp(0.45 + lum * 1.2, 0.55, 1.45) - exposure) * 0.3;
-  renderer.toneMappingExposure = exposure;
-  const m = Math.max(r, g, b, 1e-3);
-  tint.setRGB(r / m, g / m, b / m, THREE.SRGBColorSpace).lerp(white, 0.6);
-  hemi.color.copy(tint);
-  key.color.copy(tint);
+  const level = Math.max(1.5 * lum, testPose ? 0 : faceLight(src));
+  lightLevel += (THREE.MathUtils.clamp(level, 0.12, 0.8) - lightLevel) * 0.3;
+  const m = Math.max(r, g, b, 1e-4);
+  tint.setRGB(r / m, g / m, b / m, THREE.LinearSRGBColorSpace).lerp(white, 0.6);
+  setLighting(lightLevel, tint);
 }
+setLighting(NEUTRAL_LIGHT, white);
 
 // ---------- Main loop ----------
 let lastVideoTime = -1, frames = 0, fpsFrames = 0, fpsT = performance.now();
@@ -229,6 +279,7 @@ function loop() {
 }
 
 function render() {
+  FILM.time.value = performance.now() % 1000;
   let hint = "";
   if (!avatar) {
     hint = "Loading outfit…";
@@ -338,7 +389,7 @@ async function startTest() {
 }
 
 // Handy for debugging from the browser console.
-window.tryon = { get pose() { return pose; }, get avatar() { return avatar; }, settings };
+window.tryon = { get pose() { return pose; }, get avatar() { return avatar; }, settings, renderer, scene, key };
 
 $("#startBtn").onclick = () => startCamera({ profile: retryProfile });
 if (testPose) startTest();

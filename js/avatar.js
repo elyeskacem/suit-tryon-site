@@ -38,9 +38,10 @@ const LM = {
   r: { sh: 12, el: 14, wr: 16, pinky: 18, index: 20, hip: 24, knee: 26, ankle: 28, toe: 32 },
 };
 
-export async function loadAvatar(outfit) {
+// `envMap` is what metal, glass and the Rocketbox clothes reflect; fabric doesn't reflect it.
+export async function loadAvatar(outfit, { envMap = null } = {}) {
   if (!outfit.garment) {
-    const { root, meshes } = await loadRocketbox(outfit.path, { textured: true, occlude: HIDDEN_BONES });
+    const { root, meshes } = await loadRocketbox(outfit.path, { textured: true, occlude: HIDDEN_BONES, envMap });
     return new Avatar(root, meshes[0].skeleton);
   }
   const gltf = new GLTFLoader();
@@ -52,16 +53,16 @@ export async function loadAvatar(outfit) {
   const avatar = new Avatar(root, meshes[0].skeleton);
   const skeleton = new THREE.Skeleton(meshes[0].skeleton.bones);   // bound in the rest pose
   const nearest = nearestWeights(bodyVertices(meshes), 0.04 * BODY_UNITS_PER_METER);
-  dress(avatar, skeleton, body.scene, nearest, new THREE.MeshBasicMaterial({ colorWrite: false }));
+  dress(avatar, skeleton, body.scene, nearest, { body: true });
   const rigid = outfit.bone && [[skeleton.bones.indexOf(avatar.bones[outfit.bone]), 1]];
-  dress(avatar, skeleton, garment.scene, rigid ? () => rigid : nearest);
+  dress(avatar, skeleton, garment.scene, rigid ? () => rigid : nearest, { envMap });
   return avatar;
 }
 
 // With `textured`, the avatar's clothes are drawn, except where the `occlude` bones drive them.
 // Without, nothing is drawn. Either way the head, and the `occlude` bones if any, are rendered
 // depth-only.
-async function loadRocketbox(path, { textured, occlude }) {
+async function loadRocketbox(path, { textured, occlude, envMap = null }) {
   const fbx = await new FBXLoader().loadAsync(path + "model.fbx");
   const hidden = new THREE.MeshBasicMaterial({ visible: false });
   let clothes = hidden;
@@ -76,7 +77,7 @@ async function loadRocketbox(path, { textured, occlude }) {
     const [map, normalMap, roughnessMap] = await Promise.all([
       tex("body_color.jpg", true), tex("body_normal.jpg"), tex("body_roughness.jpg"),
     ]);
-    clothes = new THREE.MeshStandardMaterial({ map, normalMap, roughnessMap, roughness: 1, metalness: 0 });
+    clothes = new THREE.MeshStandardMaterial({ map, normalMap, roughnessMap, roughness: 1, metalness: 0, envMap, envMapIntensity: 0.6 });
     maskByBones(clothes, "drop");
   }
   const occludeBones = new THREE.MeshBasicMaterial({ colorWrite: false });
@@ -135,26 +136,166 @@ function maskByBones(material, mode) {
 }
 
 // ---------- Garments ----------
-// Skin a model fitted to the body's rest pose (a garment, or with an `occluder` material the
-// garment body) to the avatar's skeleton. The avatar's root is still at the origin here, so world
-// space is the body's own space.
-function dress(avatar, skeleton, scene, weightsAt, occluder) {
+// Skin a model fitted to the body's rest pose (a garment, or with `body` the garment body) to the
+// avatar's skeleton. The avatar's root is still at the origin here, so world space is the body's
+// own space. The body is drawn twice: depth-only first, to hide what is behind the person, and
+// then as a shadow catcher, so the garment's shadow falls on the person's clothes.
+const OCCLUDER = new THREE.MeshBasicMaterial({ colorWrite: false });
+const SHADOW = new THREE.ShadowMaterial({ opacity: 0.32, depthWrite: false });
+
+function dress(avatar, skeleton, scene, weightsAt, { body = false, envMap = null } = {}) {
   const toBody = new THREE.Matrix4().makeScale(BODY_UNITS_PER_METER, BODY_UNITS_PER_METER, BODY_UNITS_PER_METER);
   const parts = [];
   scene.updateMatrixWorld(true);
   scene.traverse(o => { if (o.isMesh) parts.push(o); });
   for (const part of parts) {
     const geometry = part.geometry.clone().applyMatrix4(toBody.clone().multiply(part.matrixWorld));
+    // body.glb has no normals (it was only an occluder), but shadow lookups need them.
+    if (!geometry.attributes.normal) geometry.computeVertexNormals();
     // The view is mirrored, so prints are too, or they would read backwards.
-    if (!occluder && part.material.map) mirrorPrint(geometry);
+    if (!body && part.material.map) mirrorPrint(geometry);
     setSkin(geometry, weightsAt);
-    const mesh = new THREE.SkinnedMesh(geometry, occluder ?? part.material);
-    mesh.name = part.name;
-    mesh.bind(skeleton, new THREE.Matrix4());
-    mesh.frustumCulled = false;
-    if (occluder) mesh.renderOrder = -1;    // write depth before the garment is drawn
-    avatar.root.add(mesh);
+    const meshes = body ? [new THREE.SkinnedMesh(geometry, OCCLUDER), new THREE.SkinnedMesh(geometry, SHADOW)]
+      : [new THREE.SkinnedMesh(geometry, garmentMaterial(part.material, envMap, uvPerCm(geometry)))];
+    for (const mesh of meshes) {
+      mesh.name = part.name;
+      mesh.bind(skeleton, new THREE.Matrix4());
+      mesh.frustumCulled = false;
+      avatar.root.add(mesh);
+    }
+    if (body) {
+      meshes[0].renderOrder = -1;     // write depth before the garment is drawn
+      meshes[1].receiveShadow = true;
+    } else {
+      meshes[0].castShadow = true;
+    }
   }
+}
+
+// The models' materials suit a 3D viewer; over a camera image they looked like glossy plastic.
+// So each is remade as what it is: fabric, print and card are matte (rough, with a faint
+// specular and a soft sheen at grazing angles, and no studio reflections), metal is brushed and
+// glass reflects a little. Woven fabric (by material name) gets a fabric texture, and everything
+// gets the camera's grain (FILM), so the garment isn't cleaner than the video around it.
+const WOVEN = /denim|fabric|cloth|cotton|canvas|ribbon|webbing/i;
+export const FILM = { time: { value: 0 }, grain: { value: 0.012 } };
+
+function garmentMaterial(m, envMap, uvScale) {
+  const base = { name: m.name, color: m.color, map: m.map, side: m.side, transparent: m.transparent,
+    opacity: m.opacity, alphaTest: m.alphaTest, depthWrite: m.depthWrite };
+  let out;
+  if (m.metalness > 0.5) {
+    out = new THREE.MeshStandardMaterial({ ...base, metalness: 1, roughness: Math.max(m.roughness, 0.5), envMap, envMapIntensity: 0.5 });
+  } else if (m.transparent && !m.map) {
+    out = new THREE.MeshStandardMaterial({ ...base, metalness: 0, roughness: 0.2, envMap, envMapIntensity: 0.3 });
+  } else {
+    out = new THREE.MeshPhysicalMaterial({ ...base, metalness: 0, roughness: 0.95, specularIntensity: 0.3,
+      sheen: 1, sheenRoughness: 0.75, sheenColor: m.color.clone().lerp(new THREE.Color(1, 1, 1), 0.25).multiplyScalar(0.35) });
+    if (WOVEN.test(m.name) && !m.map && uvScale > 0) {
+      const { shade, bumps, mean } = fabricTextures();
+      const repeat = 1 / (FABRIC_TILE_CM * uvScale);
+      out.color.multiplyScalar(1 / mean);
+      out.map = shade.clone();
+      out.normalMap = bumps.clone();
+      for (const t of [out.map, out.normalMap]) t.repeat.set(repeat, repeat);
+      out.normalScale.set(0.6, 0.6);
+    }
+  }
+  out.onBeforeCompile = shader => {
+    shader.uniforms.filmTime = FILM.time;
+    shader.uniforms.filmGrain = FILM.grain;
+    shader.fragmentShader = shader.fragmentShader
+      .replace("void main() {", "uniform float filmTime;\nuniform float filmGrain;\nvoid main() {")
+      .replace("#include <dithering_fragment>", `#include <dithering_fragment>
+        gl_FragColor.rgb += (fract(sin(dot(gl_FragCoord.xy + filmTime, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) * filmGrain;`);
+  };
+  out.customProgramCacheKey = () => "film";
+  return out;
+}
+
+// UV units per centimeter of the surface, from the mesh's triangles.
+function uvPerCm(geometry) {
+  const pos = geometry.attributes.position, uv = geometry.attributes.uv, index = geometry.index;
+  if (!uv) return 0;
+  const A = new THREE.Vector3(), B = new THREE.Vector3(), C = new THREE.Vector3();
+  let area = 0, uvArea = 0;
+  const n = index ? index.count : pos.count;
+  for (let i = 0; i < n; i += 3) {
+    const [a, b, c] = index ? [index.getX(i), index.getX(i + 1), index.getX(i + 2)] : [i, i + 1, i + 2];
+    A.fromBufferAttribute(pos, a); B.fromBufferAttribute(pos, b); C.fromBufferAttribute(pos, c);
+    area += B.sub(A).cross(C.sub(A)).length() / 2;
+    const ux = uv.getX(b) - uv.getX(a), uy = uv.getY(b) - uv.getY(a), vx = uv.getX(c) - uv.getX(a), vy = uv.getY(c) - uv.getY(a);
+    uvArea += Math.abs(ux * vy - uy * vx) / 2;
+  }
+  return area > 0 ? Math.sqrt(uvArea / area) : 0;
+}
+
+// A tileable woven texture, made once: a color multiplier (soft mottle, lengthwise streaks, a
+// faint twill) and a normal map (the twill's ribs and a gentle unevenness). One tile is
+// FABRIC_TILE_CM of fabric.
+const FABRIC_TILE_CM = 10;
+let fabric = null;
+function fabricTextures() {
+  if (fabric) return fabric;
+  const N = 512;
+  let seed = 7;
+  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  const smooth = t => t * t * (3 - 2 * t);
+  // Tileable value noise with cx by cy cells.
+  const noise = (cx, cy) => {
+    const g = Array.from({ length: cx * cy }, rnd);
+    return (x, y) => {
+      const fx = x / N * cx, fy = y / N * cy, x0 = Math.floor(fx), y0 = Math.floor(fy);
+      const tx = smooth(fx - x0), ty = smooth(fy - y0);
+      const at = (i, j) => g[(j % cy) * cx + (i % cx)];
+      const top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+      const bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+      return top + (bottom - top) * ty - 0.5;
+    };
+  };
+  const mottle = noise(8, 8), fine = noise(32, 32), streaks = noise(96, 4), undulate = noise(3, 3);
+  const shadeData = new Uint8Array(N * N * 4), height = new Float32Array(N * N);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const twill = Math.sin(2 * Math.PI * (x + y) / 5);
+      const i = y * N + x;
+      height[i] = 0.25 * twill + 0.6 * streaks(x, y) + 3 * undulate(x, y);
+      const v = 1 + 0.08 * mottle(x, y) + 0.04 * fine(x, y) + 0.06 * streaks(x, y) + 0.02 * twill + 0.02 * (rnd() - 0.5);
+      shadeData.fill(Math.round(THREE.MathUtils.clamp(v * 220, 0, 255)), i * 4, i * 4 + 3);
+      shadeData[i * 4 + 3] = 255;
+    }
+  }
+  // The multiplier averages below 1 (sRGB 220 leaves room above), so the material's color is
+  // divided by its mean.
+  const linear = Array.from({ length: 256 }, (_, v) => new THREE.Color().setRGB(v / 255, 0, 0, THREE.SRGBColorSpace).r);
+  let sum = 0;
+  for (let i = 0; i < shadeData.length; i += 4) sum += linear[shadeData[i]];
+  const mean = sum / (N * N);
+  const bumpData = new Uint8Array(N * N * 4);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const h = (i, j) => height[((j + N) % N) * N + ((i + N) % N)];
+      const nx = (h(x - 1, y) - h(x + 1, y)) / 2, ny = (h(x, y - 1) - h(x, y + 1)) / 2, len = Math.hypot(nx, ny, 1);
+      const i = (y * N + x) * 4;
+      bumpData[i] = (nx / len * 0.5 + 0.5) * 255;
+      bumpData[i + 1] = (ny / len * 0.5 + 0.5) * 255;
+      bumpData[i + 2] = (1 / len * 0.5 + 0.5) * 255;
+      bumpData[i + 3] = 255;
+    }
+  }
+  const texture = data => {
+    const t = new THREE.DataTexture(data, N, N);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.magFilter = THREE.LinearFilter;
+    t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.generateMipmaps = true;
+    t.anisotropy = 4;
+    t.needsUpdate = true;
+    return t;
+  };
+  fabric = { shade: texture(shadeData), bumps: texture(bumpData), mean };
+  fabric.shade.colorSpace = THREE.SRGBColorSpace;
+  return fabric;
 }
 
 // Flip a texture left to right on its part of the model.
