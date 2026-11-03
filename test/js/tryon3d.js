@@ -11,6 +11,8 @@ const MODEL_URL = isMobile
   ? "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
   : "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
 const params = new URLSearchParams(location.search);
+// Everyone in view wears the outfit, up to this many people.
+const MAX_PEOPLE = isMobile ? 3 : 4;
 const testPose = params.get("test");
 
 const $ = s => document.querySelector(s);
@@ -86,7 +88,16 @@ const outfitCards = CHOICES.map(o => {
 });
 $("#outfits").append(...outfitCards);
 
-let avatar = null;
+// The loaded outfit is a template that is never posed; each person in view wears a copy of it.
+let outfitTemplate = null;
+function dressPerson(person) {
+  if (person.avatar) scene.remove(person.avatar.root);
+  person.avatar = outfitTemplate?.clone() ?? null;
+  if (person.avatar) {
+    person.avatar.root.visible = false;
+    scene.add(person.avatar.root);
+  }
+}
 async function setOutfit(id) {
   const outfit = OUTFITS.find(o => o.id === id);
   for (const card of outfitCards) {
@@ -95,11 +106,8 @@ async function setOutfit(id) {
     card.classList.toggle("loading", card.dataset.id === id);
   }
   try {
-    const next = await loadAvatar(outfit, { envMap });
-    if (avatar) scene.remove(avatar.root);
-    avatar = next;
-    avatar.root.visible = false;
-    scene.add(avatar.root);
+    outfitTemplate = await loadAvatar(outfit, { envMap });
+    for (const person of people) dressPerson(person);
   } finally {
     for (const card of outfitCards) { card.disabled = false; card.classList.remove("loading"); }
   }
@@ -161,7 +169,7 @@ $("#snapBtn").onclick = () => {
 let landmarker = null;
 async function createLandmarker() {
   const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
-  const opts = delegate => ({ baseOptions: { modelAssetPath: MODEL_URL, delegate }, runningMode: "VIDEO", numPoses: 1 });
+  const opts = delegate => ({ baseOptions: { modelAssetPath: MODEL_URL, delegate }, runningMode: "VIDEO", numPoses: MAX_PEOPLE });
   try {
     return await PoseLandmarker.createFromOptions(fileset, opts("GPU"));
   } catch (err) {
@@ -170,27 +178,70 @@ async function createLandmarker() {
   }
 }
 
-// Smoothed pose: screen-space points (pixels, y up) and world points (meters, y up, z toward camera).
-let pose = null, missing = 0;
-function updatePose(result) {
-  const lm = result?.landmarks?.[0], wl = result?.worldLandmarks?.[0];
-  if (!lm || !wl) {
-    if (++missing > 8) pose = null;
-    return;
+// ---------- People ----------
+// Each person: a smoothed pose (screen-space points in pixels, y up; world points in meters, y up,
+// z toward the camera), how many frames they have gone undetected, and their copy of the outfit.
+// MediaPipe lists the people it finds in no fixed order, so each frame every person is matched to
+// the nearest detection, by the middle of the shoulders, nearest pairs first (with no distance
+// limit, so someone moving fast keeps their copy). A detection left over is someone new; a person
+// left over for a few frames has left.
+const people = [];
+let detected = 0;     // people MediaPipe found in the last frame
+const shoulderMid = pose => new THREE.Vector3().addVectors(pose.img[11], pose.img[12]).multiplyScalar(0.5);
+const reachOf = pose => Math.max(80, 1.5 * pose.img[11].distanceTo(pose.img[12]));
+
+function updatePeople(result) {
+  const found = (result?.landmarks ?? []).flatMap((lm, k) => {
+    const wl = result.worldLandmarks?.[k];
+    return wl ? [{
+      img: lm.map(l => new THREE.Vector3(l.x * W, -l.y * H, 0)),
+      wld: wl.map(l => new THREE.Vector3(l.x, -l.y, -l.z)),
+      vis: lm.map(l => l.visibility ?? 1),
+    }] : [];
+  });
+  detected = found.length;
+  const pairs = [];
+  people.forEach((person, i) => {
+    const at = shoulderMid(person.pose);
+    found.forEach((f, j) => pairs.push([at.distanceTo(shoulderMid(f)), i, j]));
+  });
+  pairs.sort((a, b) => a[0] - b[0]);
+  const matched = new Set(), taken = new Set();
+  for (const [, i, j] of pairs) {
+    if (matched.has(i) || taken.has(j)) continue;
+    matched.add(i);
+    taken.add(j);
+    smoothPose(people[i], found[j]);
   }
-  missing = 0;
-  const img = lm.map(l => new THREE.Vector3(l.x * W, -l.y * H, 0));
-  const wld = wl.map(l => new THREE.Vector3(l.x, -l.y, -l.z));
-  const vis = lm.map(l => l.visibility ?? 1);
-  if (!pose) { pose = { img, wld, vis }; return; }
-  // Adaptive smoothing: steady when still, responsive when moving.
+  for (let i = people.length - 1; i >= 0; i--) {
+    if (!matched.has(i) && ++people[i].missing > 8) removePerson(i);
+  }
+  for (const [j, f] of found.entries()) {
+    // A second detection right on someone already tracked is the same person again.
+    const duplicate = people.some(p => shoulderMid(p.pose).distanceTo(shoulderMid(f)) < reachOf(p.pose) / 2);
+    if (taken.has(j) || duplicate || people.length >= MAX_PEOPLE) continue;
+    const person = { pose: f, missing: 0, avatar: null };
+    dressPerson(person);
+    people.push(person);
+  }
+}
+
+// Adaptive smoothing: steady when still, responsive when moving.
+function smoothPose(person, next) {
+  person.missing = 0;
+  const pose = person.pose;
   const scale = Math.max(40, pose.img[11].distanceTo(pose.img[12]));
-  for (let i = 0; i < img.length; i++) {
-    const a = Math.min(0.9, 0.25 + img[i].distanceTo(pose.img[i]) / (scale * 0.3));
-    pose.img[i].lerp(img[i], a);
-    pose.wld[i].lerp(wld[i], a);
-    pose.vis[i] += (vis[i] - pose.vis[i]) * 0.5;
+  for (let i = 0; i < next.img.length; i++) {
+    const a = Math.min(0.9, 0.25 + next.img[i].distanceTo(pose.img[i]) / (scale * 0.3));
+    pose.img[i].lerp(next.img[i], a);
+    pose.wld[i].lerp(next.wld[i], a);
+    pose.vis[i] += (next.vis[i] - pose.vis[i]) * 0.5;
   }
+}
+
+function removePerson(i) {
+  if (people[i].avatar) scene.remove(people[i].avatar.root);
+  people.splice(i, 1);
 }
 
 // ---------- Lighting from the camera image ----------
@@ -221,10 +272,11 @@ function setLighting(level, color) {
   key.color.copy(color);
 }
 
-// The light on the face, from the skin between the eyes and the nose (its bright part, so
-// glasses, eyes and beard don't count); 0 if the face isn't clearly in view.
-function faceLight(src) {
-  if (!pose || [0, 2, 5].some(i => pose.vis[i] < 0.5)) return 0;
+// The light on a face, from the skin between the eyes and the nose (its bright part, so glasses,
+// eyes and beard don't count); 0 if the face isn't clearly in view. With several people, the
+// brightest face sets the floor.
+function faceLight(src, pose) {
+  if ([0, 2, 5].some(i => pose.vis[i] < 0.5)) return 0;
   const a = pose.img[2], b = pose.img[5], nose = pose.img[0];
   const x = Math.min(a.x, b.x), y = -Math.max(a.y, b.y), w = Math.abs(a.x - b.x), h = -nose.y - y;
   if (w < 6 || h < 4) return 0;
@@ -244,7 +296,8 @@ function matchLighting(src) {
   const n = d.length / 4;
   r /= n; g /= n; b /= n;
   const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  const level = Math.max(1.5 * lum, testPose ? 0 : faceLight(src));
+  const faces = testPose ? [] : people.map(p => faceLight(src, p.pose));
+  const level = Math.max(1.5 * lum, ...faces);
   lightLevel += (THREE.MathUtils.clamp(level, 0.12, 0.8) - lightLevel) * 0.3;
   const m = Math.max(r, g, b, 1e-4);
   tint.setRGB(r / m, g / m, b / m, THREE.LinearSRGBColorSpace).lerp(white, 0.6);
@@ -266,7 +319,7 @@ function loop() {
     if (video.videoWidth !== W || video.videoHeight !== H) resize(video.videoWidth, video.videoHeight);
     result = landmarker.detectForVideo(video, performance.now());
   }
-  updatePose(result);
+  updatePeople(result);
   render();
 
   frames++; fpsFrames++;
@@ -278,21 +331,30 @@ function loop() {
   if (testPose && frames === 5) document.title = "ready";
 }
 
+// Where people overlap, the one nearer the camera (who looks bigger) must hide the other's
+// garment. Each person is set this many centimeters (of their own size) in front of the person
+// behind, more than a body is deep, so the bodies, drawn depth-only, sort them.
+const DEPTH_GAP_CM = 20;
+
 function render() {
   FILM.time.value = performance.now() % 1000;
-  let hint = "";
-  if (!avatar) {
-    hint = "Loading outfit…";
-  } else if (!pose) {
-    hint = "Step into view, facing the camera";
-    avatar.root.visible = false;
-  } else if (pose.vis[11] < 0.5 || pose.vis[12] < 0.5) {
-    hint = "Face the camera so both shoulders are visible";
-    avatar.root.visible = false;
-  } else {
-    avatar.update(pose, settings);
-    avatar.root.visible = true;
+  let shown = 0;
+  for (const { pose, avatar } of people) {
+    const visible = !!avatar && pose.vis[11] >= 0.5 && pose.vis[12] >= 0.5;
+    if (visible) {
+      avatar.update(pose, settings);
+      shown++;
+    }
+    if (avatar) avatar.root.visible = visible;
   }
+  let z = 0, behind = null;
+  for (const { avatar } of people.filter(p => p.avatar?.root.visible).sort((a, b) => a.avatar.scale - b.avatar.scale)) {
+    if (behind) z += DEPTH_GAP_CM * (behind.scale + avatar.scale);
+    avatar.root.position.z += z;
+    behind = avatar;
+  }
+  const hint = !outfitTemplate ? "Loading outfit…" : !people.length ? "Step into view, facing the camera"
+    : !shown ? "Face the camera so both shoulders are visible" : "";
   if (settings.autoLight && frames % 10 === 0) matchLighting(testPose ? bg : video);
   renderer.render(scene, camera);
   drawDebug();
@@ -303,15 +365,17 @@ function render() {
 function drawDebug() {
   const c = dbg.getContext("2d");
   c.clearRect(0, 0, W, H);
-  if (!settings.skeleton || !pose) return;
-  const p = i => [pose.img[i].x, -pose.img[i].y];
-  c.strokeStyle = "rgba(0,255,170,0.9)"; c.lineWidth = 2;
-  for (const [a, b] of [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [24, 26], [25, 27], [26, 28]]) {
-    c.beginPath(); c.moveTo(...p(a)); c.lineTo(...p(b)); c.stroke();
-  }
-  for (const i of [0, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26]) {
-    c.fillStyle = pose.vis[i] > 0.5 ? "#0fa" : "#f55";
-    c.beginPath(); c.arc(...p(i), 5, 0, Math.PI * 2); c.fill();
+  if (!settings.skeleton) return;
+  for (const { pose } of people) {
+    const p = i => [pose.img[i].x, -pose.img[i].y];
+    c.strokeStyle = "rgba(0,255,170,0.9)"; c.lineWidth = 2;
+    for (const [a, b] of [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [24, 26], [25, 27], [26, 28]]) {
+      c.beginPath(); c.moveTo(...p(a)); c.lineTo(...p(b)); c.stroke();
+    }
+    for (const i of [0, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26]) {
+      c.fillStyle = pose.vis[i] > 0.5 ? "#0fa" : "#f55";
+      c.beginPath(); c.arc(...p(i), 5, 0, Math.PI * 2); c.fill();
+    }
   }
 }
 
@@ -335,7 +399,7 @@ async function startCamera(opts = {}) {
       statusEl.textContent = "Loading pose model and 3D outfit…";
       [landmarker] = await Promise.all([createLandmarker(), avatarReady]);
     }
-    if (!avatar) throw new Error("the 3D outfit failed to load");
+    if (!outfitTemplate) throw new Error("the 3D outfit failed to load");
 
     overlay.hidden = true;
     fpsEl.hidden = false;
@@ -355,7 +419,7 @@ function onCameraProblem(problem) {
   console.warn("Camera problem:", problem);
   hintEl.hidden = true;
   fpsEl.hidden = true;
-  pose = null;
+  while (people.length) removePerson(0);
   overlay.hidden = false;
   statusEl.className = "err";
   statusEl.textContent = describeProblem(problem);
@@ -389,7 +453,11 @@ async function startTest() {
 }
 
 // Handy for debugging from the browser console.
-window.tryon = { get pose() { return pose; }, get avatar() { return avatar; }, settings, renderer, scene, key };
+// pose and avatar are the first person's.
+window.tryon = {
+  get people() { return people; }, get detected() { return detected; }, get pose() { return people[0]?.pose ?? null; }, get avatar() { return people[0]?.avatar ?? null; },
+  settings, renderer, scene, key,
+};
 
 $("#startBtn").onclick = () => startCamera({ profile: retryProfile });
 if (testPose) startTest();

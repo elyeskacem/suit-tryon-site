@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { clone as cloneSkinned } from "three/addons/utils/SkeletonUtils.js";
 
 // An outfit is either a Rocketbox avatar folder (model.fbx + body_color/normal/roughness textures)
 // or a static .glb garment. Garments are fitted in Blender (blender/denyx_garments.blend) to
@@ -42,7 +43,7 @@ const LM = {
 export async function loadAvatar(outfit, { envMap = null } = {}) {
   if (!outfit.garment) {
     const { root, meshes } = await loadRocketbox(outfit.path, { textured: true, occlude: HIDDEN_BONES, envMap });
-    return new Avatar(root, meshes[0].skeleton);
+    return new Avatar(root, meshes[0].skeleton.bones);
   }
   const gltf = new GLTFLoader();
   const [{ root, meshes }, garment, body] = await Promise.all([
@@ -50,7 +51,7 @@ export async function loadAvatar(outfit, { envMap = null } = {}) {
     gltf.loadAsync(outfit.garment),
     gltf.loadAsync(GARMENT_BODY),
   ]);
-  const avatar = new Avatar(root, meshes[0].skeleton);
+  const avatar = new Avatar(root, meshes[0].skeleton.bones);
   const skeleton = new THREE.Skeleton(meshes[0].skeleton.bones);   // bound in the rest pose
   const nearest = nearestWeights(bodyVertices(meshes), 0.04 * BODY_UNITS_PER_METER);
   dress(avatar, skeleton, body.scene, nearest, { body: true });
@@ -388,17 +389,17 @@ function headFrame(xv, fwd, out) {
 const xyDist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
 class Avatar {
-  constructor(root, skeleton) {
+  constructor(root, bones) {
     this.root = root;
     this.bones = {};
     for (const [key, re] of Object.entries(BONE_PATTERNS)) {
-      this.bones[key] = skeleton.bones.find(b => re.test(b.name)) || null;
+      this.bones[key] = bones.find(b => re.test(b.name)) || null;
       if (!this.bones[key]) console.warn(`Avatar bone not found: ${key}`);
     }
 
     root.updateMatrixWorld(true);
-    this.restLocal = new Map(skeleton.bones.map(b => [b, b.quaternion.clone()]));
-    this.restWorld = new Map(skeleton.bones.map(b => [b, b.getWorldQuaternion(new THREE.Quaternion())]));
+    this.restLocal = new Map(bones.map(b => [b, b.quaternion.clone()]));
+    this.restWorld = new Map(bones.map(b => [b, b.getWorldQuaternion(new THREE.Quaternion())]));
 
     const P = k => this.bones[k].getWorldPosition(new THREE.Vector3());
     const up = P("neck").sub(P("hips"));
@@ -414,6 +415,15 @@ class Avatar {
     this.upperArmRest = { l: this.bones.lUpperArm.position.clone(), r: this.bones.rUpperArm.position.clone() };
     this.pxPerMeter = null;
     this.scale = null;
+  }
+
+  // Another person wearing the same outfit: a copy sharing the meshes and materials, with its own
+  // bones. Copy an avatar that hasn't been posed (update() moves its bones).
+  clone() {
+    const root = cloneSkinned(this.root);
+    const bones = [];
+    root.traverse(o => { if (o.isBone) bones.push(o); });
+    return new Avatar(root, bones);
   }
 
   /**
