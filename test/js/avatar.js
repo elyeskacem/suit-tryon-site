@@ -157,7 +157,7 @@ function dress(avatar, skeleton, scene, weightsAt, { body = false, envMap = null
     if (!body && part.material.map) mirrorPrint(geometry);
     setSkin(geometry, weightsAt);
     const meshes = body ? [new THREE.SkinnedMesh(geometry, OCCLUDER), new THREE.SkinnedMesh(geometry, SHADOW)]
-      : [new THREE.SkinnedMesh(geometry, garmentMaterial(part.material, envMap, uvPerCm(geometry)))];
+      : [new THREE.SkinnedMesh(geometry, garmentMaterial(part.material, envMap, geometry))];
     for (const mesh of meshes) {
       mesh.name = part.name;
       mesh.bind(skeleton, new THREE.Matrix4());
@@ -176,15 +176,17 @@ function dress(avatar, skeleton, scene, weightsAt, { body = false, envMap = null
 // The models' materials suit a 3D viewer; over a camera image they looked like glossy plastic.
 // So each is remade as what it is: fabric, print and card are matte (rough, with a faint
 // specular and a soft sheen at grazing angles, and no studio reflections), metal is brushed and
-// glass reflects a little. Woven fabric (by material name) gets a fabric texture, and everything
-// gets the camera's grain (FILM), so the garment isn't cleaner than the video around it.
+// glass reflects a little. Woven fabric (by material name) is made to look like denim (see
+// below), and everything gets the camera's grain (FILM), so the garment isn't cleaner than the
+// video around it.
 const WOVEN = /denim|fabric|cloth|cotton|canvas|ribbon|webbing/i;
 export const FILM = { time: { value: 0 }, grain: { value: 0.012 } };
 
-function garmentMaterial(m, envMap, uvScale) {
+// Denim needs the part's geometry: its UVs size the weave, and it gets an aEdge attribute.
+function garmentMaterial(m, envMap, geometry) {
   const base = { name: m.name, color: m.color, map: m.map, side: m.side, transparent: m.transparent,
     opacity: m.opacity, alphaTest: m.alphaTest, depthWrite: m.depthWrite };
-  let out;
+  let out, denim = null;
   if (m.metalness > 0.5) {
     out = new THREE.MeshStandardMaterial({ ...base, metalness: 1, roughness: Math.max(m.roughness, 0.5), envMap, envMapIntensity: 0.5 });
   } else if (m.transparent && !m.map) {
@@ -192,15 +194,8 @@ function garmentMaterial(m, envMap, uvScale) {
   } else {
     out = new THREE.MeshPhysicalMaterial({ ...base, metalness: 0, roughness: 0.95, specularIntensity: 0.3,
       sheen: 1, sheenRoughness: 0.75, sheenColor: m.color.clone().lerp(new THREE.Color(1, 1, 1), 0.25).multiplyScalar(0.35) });
-    if (WOVEN.test(m.name) && !m.map && uvScale > 0) {
-      const { shade, bumps, mean } = fabricTextures();
-      const repeat = 1 / (FABRIC_TILE_CM * uvScale);
-      out.color.multiplyScalar(1 / mean);
-      out.map = shade.clone();
-      out.normalMap = bumps.clone();
-      for (const t of [out.map, out.normalMap]) t.repeat.set(repeat, repeat);
-      out.normalScale.set(0.6, 0.6);
-    }
+    const uvScale = uvPerCm(geometry);
+    if (WOVEN.test(m.name) && !m.map && uvScale > 0) denim = makeDenim(out, m.color, geometry, uvScale);
   }
   out.onBeforeCompile = shader => {
     shader.uniforms.filmTime = FILM.time;
@@ -209,8 +204,9 @@ function garmentMaterial(m, envMap, uvScale) {
       .replace("void main() {", "uniform float filmTime;\nuniform float filmGrain;\nvoid main() {")
       .replace("#include <dithering_fragment>", `#include <dithering_fragment>
         gl_FragColor.rgb += (fract(sin(dot(gl_FragCoord.xy + filmTime, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) * filmGrain;`);
+    if (denim) denim(shader);
   };
-  out.customProgramCacheKey = () => "film";
+  out.customProgramCacheKey = () => denim ? "film-denim" : "film";
   return out;
 }
 
@@ -231,72 +227,245 @@ function uvPerCm(geometry) {
   return area > 0 ? Math.sqrt(uvArea / area) : 0;
 }
 
-// A tileable woven texture, made once: a color multiplier (soft mottle, lengthwise streaks, a
-// faint twill) and a normal map (the twill's ribs and a gentle unevenness). One tile is
-// FABRIC_TILE_CM of fabric.
-const FABRIC_TILE_CM = 10;
-let fabric = null;
-function fabricTextures() {
-  if (fabric) return fabric;
-  const N = 512;
-  let seed = 7;
-  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
-  const smooth = t => t * t * (3 - 2 * t);
-  // Tileable value noise with cx by cy cells.
-  const noise = (cx, cy) => {
-    const g = Array.from({ length: cx * cy }, rnd);
-    return (x, y) => {
-      const fx = x / N * cx, fy = y / N * cy, x0 = Math.floor(fx), y0 = Math.floor(fy);
-      const tx = smooth(fx - x0), ty = smooth(fy - y0);
-      const at = (i, j) => g[(j % cy) * cx + (i % cx)];
-      const top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
-      const bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
-      return top + (bottom - top) * ty - 0.5;
-    };
+// ---------- Denim ----------
+// Denim is a twill of indigo warp over white weft. Up close it is a diagonal rib flecked with
+// white; from further away a heathered, streaky indigo, paler where it wears along hems, pocket
+// edges and seams. So a denim material gets:
+// - a woven color texture and normal map, tiled at real size from the part's UVs (DENIM_TILE_CM
+//   of cloth per tile): warp, weft showing through the twill, streaks where the yarn's dye
+//   varies, heathered flecks;
+// - wear along the cloth's edges: each vertex knows its distance along the cloth to the nearest
+//   edge (aEdge, in cm), and the shader fades a band WORN_BAND_CM wide (narrower on straps),
+//   unevenly;
+// - a slow mottle from 3D noise of the rest position, which doesn't repeat with the texture.
+const DENIM_TILE_CM = 10;
+const WORN_BAND_CM = 0.45;
+const WEFT = new THREE.Color(0.7, 0.72, 0.76);    // undyed cotton, linear
+
+function makeDenim(material, color, geometry, uvScale) {
+  const repeat = 1 / (DENIM_TILE_CM * uvScale);
+  material.map = denimColor(color).clone();
+  material.normalMap = denimBumps().clone();
+  for (const t of [material.map, material.normalMap]) t.repeat.set(repeat, repeat);
+  material.normalScale.set(0.9, 0.9);
+  material.color.set(0xffffff);               // the color is in the texture
+  geometry.setAttribute("aEdge", new THREE.BufferAttribute(edgeDistances(geometry), 1));
+  const worn = color.clone().lerp(WEFT, 0.45);   // faded indigo
+  return shader => {
+    shader.uniforms.denimWorn = { value: worn };
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute float aEdge;\nvarying float vEdge;\nvarying vec3 vRest;")
+      .replace("#include <begin_vertex>", "#include <begin_vertex>\nvEdge = aEdge;\nvRest = position;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", `#include <common>
+        varying float vEdge;
+        varying vec3 vRest;
+        uniform vec3 denimWorn;
+        float denimHash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+        float denimNoise(vec3 x) {
+          vec3 i = floor(x), f = fract(x);
+          f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(mix(denimHash(i), denimHash(i + vec3(1, 0, 0)), f.x), mix(denimHash(i + vec3(0, 1, 0)), denimHash(i + vec3(1, 1, 0)), f.x), f.y),
+                     mix(mix(denimHash(i + vec3(0, 0, 1)), denimHash(i + vec3(1, 0, 1)), f.x), mix(denimHash(i + vec3(0, 1, 1)), denimHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+        }`)
+      .replace("#include <map_fragment>", `#include <map_fragment>
+        // A slow mottle (the rest position is in cm), then wear along the cloth's edges.
+        diffuseColor.rgb *= 0.84 + 0.32 * (0.6 * denimNoise(vRest / 11.0) + 0.4 * denimNoise(vRest / 3.7));
+        float worn = (1.0 - smoothstep(0.05, ${WORN_BAND_CM.toFixed(2)}, vEdge)) * (0.45 + 0.55 * denimNoise(vRest * 2.3 + 7.0));
+        diffuseColor.rgb = mix(diffuseColor.rgb, denimWorn, 0.8 * worn);`);
   };
-  const mottle = noise(8, 8), fine = noise(32, 32), streaks = noise(96, 4), undulate = noise(3, 3);
-  const shadeData = new Uint8Array(N * N * 4), height = new Float32Array(N * N);
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      const twill = Math.sin(2 * Math.PI * (x + y) / 5);
-      const i = y * N + x;
-      height[i] = 0.25 * twill + 0.6 * streaks(x, y) + 3 * undulate(x, y);
-      const v = 1 + 0.08 * mottle(x, y) + 0.04 * fine(x, y) + 0.06 * streaks(x, y) + 0.02 * twill + 0.02 * (rnd() - 0.5);
-      shadeData.fill(Math.round(THREE.MathUtils.clamp(v * 220, 0, 255)), i * 4, i * 4 + 3);
-      shadeData[i * 4 + 3] = 255;
+}
+
+// Distance in cm along the cloth from each vertex to its nearest edge: mesh edges with a face on
+// one side only, which are the hems of panels, pockets and straps (and seams, where the mesh is
+// split). Stretched on narrow pieces, see below.
+function edgeDistances(geometry) {
+  const { position: pos, normal } = geometry.attributes;
+  // The export splits vertices wherever the normal jumps, sometimes on every face, so first weld
+  // vertices that share a position and roughly a normal: only real edges of the cloth, where its
+  // face turns sharply into its thickness, stay open.
+  const weld = new Int32Array(pos.count), groups = new Map(), normals = [];
+  const N = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    const key = `${Math.round(pos.getX(i) * 200)},${Math.round(pos.getY(i) * 200)},${Math.round(pos.getZ(i) * 200)}`;
+    N.fromBufferAttribute(normal, i);
+    const near = groups.get(key) ?? [];
+    let id = near.find(j => normals[j].dot(N) > 0.75);
+    if (id === undefined) {
+      id = normals.length;
+      normals.push(N.clone());
+      near.push(id);
+      groups.set(key, near);
+    }
+    weld[i] = id;
+  }
+  const n = normals.length, at = new Int32Array(n);
+  for (let i = 0; i < pos.count; i++) at[weld[i]] = i;
+  const raw = geometry.index ? geometry.index.array : Array.from({ length: pos.count }, (_, i) => i);
+  const index = Array.from(raw, i => weld[i]);
+  const uses = new Map(), edges = [];
+  for (let t = 0; t < index.length; t += 3) {
+    for (let k = 0; k < 3; k++) {
+      const a = Math.min(index[t + k], index[t + (k + 1) % 3]), b = Math.max(index[t + k], index[t + (k + 1) % 3]);
+      if (a === b) continue;
+      const key = a * n + b, c = uses.get(key);
+      if (c === undefined) edges.push(a, b);
+      uses.set(key, (c ?? 0) + 1);
     }
   }
-  // The multiplier averages below 1 (sRGB 220 leaves room above), so the material's color is
-  // divided by its mean.
-  const linear = Array.from({ length: 256 }, (_, v) => new THREE.Color().setRGB(v / 255, 0, 0, THREE.SRGBColorSpace).r);
-  let sum = 0;
-  for (let i = 0; i < shadeData.length; i += 4) sum += linear[shadeData[i]];
-  const mean = sum / (N * N);
-  const bumpData = new Uint8Array(N * N * 4);
+  const links = Array.from({ length: n }, () => []);
+  const dist = new Float32Array(n).fill(Infinity);
+  const A = new THREE.Vector3(), B = new THREE.Vector3();
+  for (let e = 0; e < edges.length; e += 2) {
+    const a = edges[e], b = edges[e + 1];
+    const d = A.fromBufferAttribute(pos, at[a]).distanceTo(B.fromBufferAttribute(pos, at[b]));
+    links[a].push(b, d);
+    links[b].push(a, d);
+    if (uses.get(a * n + b) === 1) dist[a] = dist[b] = 0;
+  }
+  // Dijkstra from all edge vertices at once, with a binary heap of [distance, vertex].
+  const heap = [];
+  const push = item => {
+    heap.push(item);
+    for (let i = heap.length - 1; i > 0;) {
+      const up = (i - 1) >> 1;
+      if (heap[up][0] <= heap[i][0]) break;
+      [heap[up], heap[i]] = [heap[i], heap[up]];
+      i = up;
+    }
+  };
+  const pop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]];
+        i = m;
+      }
+    }
+    return top;
+  };
+  for (let i = 0; i < n; i++) if (dist[i] === 0) push([0, i]);
+  while (heap.length) {
+    const [d, v] = pop();
+    if (d > dist[v]) continue;
+    const near = links[v];
+    for (let k = 0; k < near.length; k += 2) {
+      const w = near[k], nd = d + near[k + 1];
+      if (nd < dist[w]) {
+        dist[w] = nd;
+        push([nd, w]);
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) if (dist[i] === Infinity) dist[i] = 100;    // a closed surface
+  // A narrow piece would be worn across most of its width, so on each piece of cloth the
+  // distances are stretched to keep the worn band within a quarter of its half-width. A piece
+  // with no vertex inside it (a strap one face wide, like the lanyard's) can't show a band at
+  // all, so it isn't worn.
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const root = i => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
+  for (let e = 0; e < edges.length; e += 2) parent[root(edges[e])] = root(edges[e + 1]);
+  const widest = new Map();
+  for (let i = 0; i < n; i++) if (dist[i] < 100) widest.set(root(i), Math.max(widest.get(root(i)) ?? 0, dist[i]));
+  for (let i = 0; i < n; i++) {
+    const w = widest.get(root(i)) ?? 0;
+    dist[i] = w > 0 ? dist[i] * Math.max(1, WORN_BAND_CM / (0.25 * w)) : 100;
+  }
+  return Float32Array.from(weld, id => dist[id]);
+}
+
+// Tileable value noise over an N by N texture, with cx by cy cells, in -0.5..0.5.
+function tileNoise(N, cx, cy, rnd) {
+  const g = Array.from({ length: cx * cy }, rnd);
+  const smooth = t => t * t * (3 - 2 * t);
+  return (x, y) => {
+    const fx = x / N * cx, fy = y / N * cy, x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const tx = smooth(fx - x0), ty = smooth(fy - y0);
+    const at = (i, j) => g[(j % cy) * cx + (i % cx)];
+    const top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+    const bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+    return top + (bottom - top) * ty - 0.5;
+  };
+}
+
+const DENIM_N = 512;
+const seeded = seed => () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+// The twill's ribs run up to the right, about 63 degrees from horizontal, 0.8 mm apart.
+const twillAt = (x, y) => 0.5 + 0.5 * Math.sin(2 * Math.PI * (2 * x + y) / 9);
+
+// The woven color for a denim of this (indigo) color, made once per color.
+const denimColors = new Map();
+function denimColor(color) {
+  const key = color.getHexString();
+  if (denimColors.has(key)) return denimColors.get(key);
+  const N = DENIM_N, rnd = seeded(11);
+  const warpEnds = tileNoise(N, 170, 7, rnd), slubs = tileNoise(N, 48, 9, rnd), mottle = tileNoise(N, 6, 6, rnd);
+  // Linear to sRGB bytes.
+  const toByte = Array.from({ length: 4096 }, (_, i) => { const c = i / 4095; return Math.round(255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055)); });
+  const data = new Uint8Array(N * N * 4);
   for (let y = 0; y < N; y++) {
     for (let x = 0; x < N; x++) {
-      const h = (i, j) => height[((j + N) % N) * N + ((i + N) % N)];
+      // Indigo varies by warp end (thin streaks) and along slubs (thicker stretches of yarn).
+      const dye = 1 + 0.45 * warpEnds(x, y) + 0.4 * slubs(x, y) + 0.2 * mottle(x, y) + 0.12 * (rnd() - 0.5);
+      // The weft shows between the warp floats, more where the twill rib dips, and in the odd nep.
+      let weft = 0.24 * Math.max(0, twillAt(x, y) - 0.45) / 0.55;
+      if (rnd() < 0.004) weft = 0.6;
+      const i = (y * N + x) * 4;
+      for (let k = 0; k < 3; k++) {
+        const warp = [color.r, color.g, color.b][k] * Math.max(0.2, dye);
+        const c = warp + ([WEFT.r, WEFT.g, WEFT.b][k] - warp) * weft;
+        data[i + k] = toByte[Math.min(4095, Math.max(0, Math.round(c * 4095)))];
+      }
+      data[i + 3] = 255;
+    }
+  }
+  const texture = repeatingTexture(data, N);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  denimColors.set(key, texture);
+  return texture;
+}
+
+// The weave's relief, made once: the twill's ribs, the warp ends, slubs and a gentle unevenness.
+let denimRelief = null;
+function denimBumps() {
+  if (denimRelief) return denimRelief;
+  const N = DENIM_N, rnd = seeded(7);
+  const warpEnds = tileNoise(N, 170, 7, rnd), slubs = tileNoise(N, 48, 9, rnd), undulate = tileNoise(N, 3, 3, rnd);
+  const height = new Float32Array(N * N);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) height[y * N + x] = 0.5 * twillAt(x, y) + 0.5 * warpEnds(x, y) + 0.8 * slubs(x, y) + 3 * undulate(x, y);
+  }
+  const data = new Uint8Array(N * N * 4);
+  const h = (i, j) => height[((j + N) % N) * N + ((i + N) % N)];
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
       const nx = (h(x - 1, y) - h(x + 1, y)) / 2, ny = (h(x, y - 1) - h(x, y + 1)) / 2, len = Math.hypot(nx, ny, 1);
       const i = (y * N + x) * 4;
-      bumpData[i] = (nx / len * 0.5 + 0.5) * 255;
-      bumpData[i + 1] = (ny / len * 0.5 + 0.5) * 255;
-      bumpData[i + 2] = (1 / len * 0.5 + 0.5) * 255;
-      bumpData[i + 3] = 255;
+      data[i] = (nx / len * 0.5 + 0.5) * 255;
+      data[i + 1] = (ny / len * 0.5 + 0.5) * 255;
+      data[i + 2] = (1 / len * 0.5 + 0.5) * 255;
+      data[i + 3] = 255;
     }
   }
-  const texture = data => {
-    const t = new THREE.DataTexture(data, N, N);
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.magFilter = THREE.LinearFilter;
-    t.minFilter = THREE.LinearMipmapLinearFilter;
-    t.generateMipmaps = true;
-    t.anisotropy = 4;
-    t.needsUpdate = true;
-    return t;
-  };
-  fabric = { shade: texture(shadeData), bumps: texture(bumpData), mean };
-  fabric.shade.colorSpace = THREE.SRGBColorSpace;
-  return fabric;
+  denimRelief = repeatingTexture(data, N);
+  return denimRelief;
+}
+
+function repeatingTexture(data, N) {
+  const t = new THREE.DataTexture(data, N, N);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true;
+  t.anisotropy = 4;
+  t.needsUpdate = true;
+  return t;
 }
 
 // Flip a texture left to right on its part of the model.
@@ -484,8 +653,10 @@ class Avatar {
     for (const [s, lm] of [["l", LM.l], ["r", LM.r]]) {
       const handTip = _a.addVectors(wld[lm.pinky], wld[lm.index]).multiplyScalar(0.5);
       this.aim(B[s + "UpperArm"], B[s + "Forearm"], wld[lm.sh], wld[lm.el], vis[lm.el] > 0.3);
-      this.aim(B[s + "Forearm"], B[s + "Hand"], wld[lm.el], wld[lm.wr], vis[lm.el] > 0.3 && vis[lm.wr] > 0.3);
-      this.aim(B[s + "Hand"], B[s + "Finger"], wld[lm.wr], handTip, vis[lm.wr] > 0.3);
+      // A wrist MediaPipe barely sees (out of frame, behind a desk) is a guess, and a hand aimed at
+      // it would cut a hole in the garment, so the forearm and hand need a surer wrist.
+      this.aim(B[s + "Forearm"], B[s + "Hand"], wld[lm.el], wld[lm.wr], vis[lm.el] > 0.3 && vis[lm.wr] > 0.5);
+      this.aim(B[s + "Hand"], B[s + "Finger"], wld[lm.wr], handTip, vis[lm.wr] > 0.5);
       this.aim(B[s + "Thigh"], B[s + "Calf"], wld[lm.hip], wld[lm.knee], vis[lm.knee] > 0.5);
       this.aim(B[s + "Calf"], B[s + "Foot"], wld[lm.knee], wld[lm.ankle], vis[lm.knee] > 0.5 && vis[lm.ankle] > 0.5);
       this.aim(B[s + "Foot"], B[s + "Toe"], wld[lm.ankle], wld[lm.toe], vis[lm.ankle] > 0.5 && vis[lm.toe] > 0.5);
