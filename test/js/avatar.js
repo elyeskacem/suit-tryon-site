@@ -153,8 +153,9 @@ function dress(avatar, skeleton, scene, weightsAt, { body = false, envMap = null
     const geometry = part.geometry.clone().applyMatrix4(toBody.clone().multiply(part.matrixWorld));
     // body.glb has no normals (it was only an occluder), but shadow lookups need them.
     if (!geometry.attributes.normal) geometry.computeVertexNormals();
-    // The view is mirrored, so prints are too, or they would read backwards.
-    if (!body && part.material.map) mirrorPrint(geometry);
+    // The view is mirrored, so prints are too, or they would read backwards. A woven fabric's
+    // own texture is cloth, not a print, so it isn't flipped.
+    if (!body && part.material.map && !WOVEN.test(part.material.name)) mirrorPrint(geometry);
     setSkin(geometry, weightsAt);
     const meshes = body ? [new THREE.SkinnedMesh(geometry, OCCLUDER), new THREE.SkinnedMesh(geometry, SHADOW)]
       : [new THREE.SkinnedMesh(geometry, garmentMaterial(part.material, envMap, geometry))];
@@ -192,10 +193,13 @@ function garmentMaterial(m, envMap, geometry) {
   } else if (m.transparent && !m.map) {
     out = new THREE.MeshStandardMaterial({ ...base, metalness: 0, roughness: 0.2, envMap, envMapIntensity: 0.3 });
   } else {
+    const woven = WOVEN.test(m.name);
+    // Woven fabric with its own color texture (a scanned denim) is tinted by that texture's color.
+    const tint = woven && m.map ? meanColor(m.map).multiply(m.color) : m.color;
     out = new THREE.MeshPhysicalMaterial({ ...base, metalness: 0, roughness: 0.95, specularIntensity: 0.3,
-      sheen: 1, sheenRoughness: 0.75, sheenColor: m.color.clone().lerp(new THREE.Color(1, 1, 1), 0.25).multiplyScalar(0.35) });
+      sheen: 1, sheenRoughness: 0.75, sheenColor: tint.clone().lerp(new THREE.Color(1, 1, 1), 0.25).multiplyScalar(0.35) });
     const uvScale = uvPerCm(geometry);
-    if (WOVEN.test(m.name) && !m.map && uvScale > 0) denim = makeDenim(out, m.color, geometry, uvScale);
+    if (woven && uvScale > 0) denim = makeDenim(out, tint, geometry, uvScale);
   }
   out.onBeforeCompile = shader => {
     shader.uniforms.filmTime = FILM.time;
@@ -208,6 +212,19 @@ function garmentMaterial(m, envMap, geometry) {
   };
   out.customProgramCacheKey = () => denim ? "film-denim" : "film";
   return out;
+}
+
+// A texture's average color (linear), from a tiny copy of its image.
+function meanColor(texture) {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 16;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(texture.image, 0, 0, 16, 16);
+  const px = ctx.getImageData(0, 0, 16, 16).data;
+  let r = 0, g = 0, b = 0;
+  for (let i = 0; i < px.length; i += 4) { r += px[i]; g += px[i + 1]; b += px[i + 2]; }
+  const n = (px.length / 4) * 255;
+  return new THREE.Color().setRGB(r / n, g / n, b / n, THREE.SRGBColorSpace);
 }
 
 // UV units per centimeter of the surface, from the mesh's triangles.
@@ -233,7 +250,8 @@ function uvPerCm(geometry) {
 // edges and seams. So a denim material gets:
 // - a woven color texture and normal map, tiled at real size from the part's UVs (DENIM_TILE_CM
 //   of cloth per tile): warp, weft showing through the twill, streaks where the yarn's dye
-//   varies, heathered flecks;
+//   varies, heathered flecks. A material with its own color texture (the apron's denim, taken
+//   from a scan of the real one) keeps it, tiled by its own UVs, and gets only the normal map;
 // - wear along the cloth's edges: each vertex knows its distance along the cloth to the nearest
 //   edge (aEdge, in cm), and the shader fades a band WORN_BAND_CM wide (narrower on straps),
 //   unevenly;
@@ -244,9 +262,14 @@ const WEFT = new THREE.Color(0.7, 0.72, 0.76);    // undyed cotton, linear
 
 function makeDenim(material, color, geometry, uvScale) {
   const repeat = 1 / (DENIM_TILE_CM * uvScale);
-  material.map = denimColor(color).clone();
+  if (material.map) {
+    material.map.anisotropy = 8;
+  } else {
+    material.map = denimColor(color).clone();
+    material.map.repeat.set(repeat, repeat);
+  }
   material.normalMap = denimBumps().clone();
-  for (const t of [material.map, material.normalMap]) t.repeat.set(repeat, repeat);
+  material.normalMap.repeat.set(repeat, repeat);
   material.normalScale.set(0.9, 0.9);
   material.color.set(0xffffff);               // the color is in the texture
   geometry.setAttribute("aEdge", new THREE.BufferAttribute(edgeDistances(geometry), 1));

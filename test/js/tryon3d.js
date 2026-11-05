@@ -75,7 +75,7 @@ resize(W, H);
 // ---------- Outfit ----------
 // Only the DENYX garments are offered; each gets a card with a thumbnail from assets/ui/.
 const CHOICES = OUTFITS.filter(o => o.garment);
-const CARD_TEXT = { denyx_apron: ["Apron", "Denim bib apron"], denyx_badge: ["Badge", "Lanyard & card holder"] };
+const CARD_TEXT = { denyx_apron: ["Apron", "Denim waist apron"], denyx_badge: ["Badge", "Lanyard & card holder"] };
 const outfitCards = CHOICES.map(o => {
   const [name, note] = CARD_TEXT[o.id] ?? [o.name, ""];
   const card = document.createElement("button");
