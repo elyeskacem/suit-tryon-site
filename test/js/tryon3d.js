@@ -73,15 +73,18 @@ window.addEventListener("resize", fitView);
 resize(W, H);
 
 // ---------- Outfit ----------
-// Only the DENYX garments are offered; each gets a card with a thumbnail from assets/ui/.
-const CHOICES = OUTFITS.filter(o => o.garment);
-const CARD_TEXT = { denyx_apron: ["Apron", "Denim waist apron"], denyx_badge: ["Badge", "Lanyard & card holder"] };
-const outfitCards = CHOICES.map(o => {
+// Each outfit gets a card, with a thumbnail from assets/ui/. The first one is worn at the start.
+const CARD_TEXT = {
+  denyx_apron: ["Apron", "Denim waist apron"], denyx_badge: ["Badge", "Lanyard & card holder"],
+  denyx_workwear: ["Workwear", "Denim coverall"], male_adult_07: ["Blazer", "Shirt & jeans"],
+};
+const outfitCards = OUTFITS.map(o => {
   const [name, note] = CARD_TEXT[o.id] ?? [o.name, ""];
   const card = document.createElement("button");
   card.className = "outfit";
   card.dataset.id = o.id;
   card.setAttribute("role", "radio");
+  card.setAttribute("aria-label", note ? `${name}, ${note}` : name);    // phones hide the note
   card.innerHTML = `<span class="thumb"><img src="assets/ui/${o.id}.png" alt=""></span><span><b>${name}</b><small>${note}</small></span>`;
   card.onclick = () => { if (card.getAttribute("aria-checked") !== "true") setOutfit(o.id); };
   return card;
@@ -112,7 +115,7 @@ async function setOutfit(id) {
     for (const card of outfitCards) { card.disabled = false; card.classList.remove("loading"); }
   }
 }
-const firstOutfit = CHOICES.some(o => o.id === params.get("outfit")) ? params.get("outfit") : CHOICES[0].id;
+const firstOutfit = OUTFITS.some(o => o.id === params.get("outfit")) ? params.get("outfit") : OUTFITS[0].id;
 const avatarReady = setOutfit(firstOutfit).catch(err => {
   console.error(err);
   statusEl.className = "err";

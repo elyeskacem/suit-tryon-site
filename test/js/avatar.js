@@ -10,9 +10,10 @@ import { clone as cloneSkinned } from "three/addons/utils/SkeletonUtils.js";
 // they hide what is behind the person (the back of a garment, a lanyard behind the neck). A garment
 // with a `bone` rides on that bone rigidly; any other bends with the body under it.
 export const OUTFITS = [
-  { id: "male_adult_07", name: "Grey blazer, shirt & jeans", path: "assets/avatars/male_adult_07/" },
   { id: "denyx_apron", name: "DENYX apron", garment: "assets/garments/denyx_apron.glb" },
   { id: "denyx_badge", name: "DENYX lanyard badge", garment: "assets/garments/denyx_badge.glb", bone: "spine2" },
+  { id: "denyx_workwear", name: "DENYX workwear coverall", garment: "assets/garments/denyx_workwear.glb" },
+  { id: "male_adult_07", name: "Grey blazer, shirt & jeans", path: "assets/avatars/male_adult_07/" },
 ];
 const AVATAR = "assets/avatars/male_adult_07/";
 const GARMENT_BODY = "assets/garments/body.glb";
