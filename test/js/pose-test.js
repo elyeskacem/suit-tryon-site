@@ -1,5 +1,5 @@
 // Synthetic MediaPipe-style results for testing without a camera: open 3d.html?test=<pose>
-// Poses: down, hips, wave, cross, turn, full, and group (three people)
+// Poses: down, hips, wave, cross, flex, turn, full, and group (three people)
 // World points are meters in MediaPipe's convention: x = image right (the person's left), y = down,
 // z = away from the camera, origin between the hips.
 
@@ -19,6 +19,8 @@ const LEFT_ARM = {
   hips: [[0.4, -0.26, 0.06], [0.19, -0.03, -0.07]],
   wave: [[0.42, -0.66, 0.02], [0.45, -0.95, -0.03]],
   cross: [[0.23, -0.24, -0.12], [-0.06, -0.3, -0.26]],
+  // Elbow out and toward the camera, forearm up; the arm is longer than the avatar's.
+  flex: [[0.43, -0.27, -0.12], [0.41, -0.63, -0.2]],
 };
 const SYMMETRIC = new Set(["down", "hips"]);
 

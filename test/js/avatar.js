@@ -593,6 +593,8 @@ class Avatar {
 
     root.updateMatrixWorld(true);
     this.restLocal = new Map(bones.map(b => [b, b.quaternion.clone()]));
+    this.restPos = new Map(bones.map(b => [b, b.position.clone()]));
+    this.length = new Map();      // per bone: how much its parent bone is lengthened (see reach)
     this.restWorld = new Map(bones.map(b => [b, b.getWorldQuaternion(new THREE.Quaternion())]));
 
     const P = k => this.bones[k].getWorldPosition(new THREE.Vector3());
@@ -630,12 +632,16 @@ class Avatar {
     const { img, wld, vis } = pose;
     const B = this.bones, root = this.root;
 
-    // Pixels per meter, from the shoulder line and the torso (robust to turning sideways).
+    // Pixels per meter, from the shoulder line and the torso (robust to turning sideways). With the
+    // hips out of the picture, MediaPipe only guesses where they are in it, so then from the
+    // shoulders alone.
     const midShW = _a.addVectors(wld[11], wld[12]).multiplyScalar(0.5);
     const midHipW = _b.addVectors(wld[23], wld[24]).multiplyScalar(0.5);
     const midShI = new THREE.Vector3().addVectors(img[11], img[12]).multiplyScalar(0.5);
     const midHipI = new THREE.Vector3().addVectors(img[23], img[24]).multiplyScalar(0.5);
-    const k = (xyDist(img[11], img[12]) + xyDist(midShI, midHipI)) / (xyDist(wld[11], wld[12]) + xyDist(midShW, midHipW));
+    const hipsSeen = vis[23] > 0.5 && vis[24] > 0.5;
+    const k = (xyDist(img[11], img[12]) + (hipsSeen ? xyDist(midShI, midHipI) : 0))
+      / (xyDist(wld[11], wld[12]) + (hipsSeen ? xyDist(midShW, midHipW) : 0));
     this.pxPerMeter = this.pxPerMeter == null ? k : this.pxPerMeter + (k - this.pxPerMeter) * 0.2;
     const shoulderPx = this.pxPerMeter * wld[11].distanceTo(wld[12]);
     const torsoPx = this.pxPerMeter * midShW.distanceTo(midHipW);
@@ -647,12 +653,14 @@ class Avatar {
     root.position.set(0, 0, 0);
     root.scale.setScalar(this.scale * opts.fit);
 
-    // Then move the shoulder joints most of the way toward the person's shoulder width
-    // (not all the way, so the jacket still covers the real shoulders).
+    // Then move the shoulder joints toward the person's shoulder width: all the way out for broader
+    // shoulders than the model's, so the garment covers them, and most of the way in for narrower
+    // ones (not all the way, so the jacket still covers the real shoulders).
     const halfDelta = (shoulderPx / this.scale - this.modelShoulder) / 2;
+    const toward = halfDelta > 0 ? 1 : 0.7;
     for (const s of ["l", "r"]) {
       const rest = this.upperArmRest[s], len = rest.length();
-      B[s + "UpperArm"].position.copy(rest).multiplyScalar(THREE.MathUtils.clamp((len + halfDelta * 0.7) / len, 0.5, 1.4));
+      B[s + "UpperArm"].position.copy(rest).multiplyScalar(THREE.MathUtils.clamp((len + halfDelta * toward) / len, 0.5, 1.4));
     }
     root.updateMatrixWorld(true);
 
@@ -674,25 +682,35 @@ class Avatar {
     this.setWorldRotation(B.lClavicle, qChest);
     this.setWorldRotation(B.rClavicle, qChest);
 
-    // Limbs: point each bone at the next joint. Joints the camera can't see keep the rest pose.
-    for (const [s, lm] of [["l", LM.l], ["r", LM.r]]) {
-      const handTip = _a.addVectors(wld[lm.pinky], wld[lm.index]).multiplyScalar(0.5);
-      this.aim(B[s + "UpperArm"], B[s + "Forearm"], wld[lm.sh], wld[lm.el], vis[lm.el] > 0.3);
-      // A wrist MediaPipe barely sees (out of frame, behind a desk) is a guess, and a hand aimed at
-      // it would cut a hole in the garment, so the forearm and hand need a surer wrist.
-      this.aim(B[s + "Forearm"], B[s + "Hand"], wld[lm.el], wld[lm.wr], vis[lm.el] > 0.3 && vis[lm.wr] > 0.5);
-      this.aim(B[s + "Hand"], B[s + "Finger"], wld[lm.wr], handTip, vis[lm.wr] > 0.5);
-      this.aim(B[s + "Thigh"], B[s + "Calf"], wld[lm.hip], wld[lm.knee], vis[lm.knee] > 0.5);
-      this.aim(B[s + "Calf"], B[s + "Foot"], wld[lm.knee], wld[lm.ankle], vis[lm.knee] > 0.5 && vis[lm.ankle] > 0.5);
-      this.aim(B[s + "Foot"], B[s + "Toe"], wld[lm.ankle], wld[lm.toe], vis[lm.ankle] > 0.5 && vis[lm.toe] > 0.5);
-    }
-
     // Place the model so its shoulder joints sit on the person's shoulders.
     root.updateMatrixWorld(true);
     const ml = B.lUpperArm.getWorldPosition(_a), mr = B.rUpperArm.getWorldPosition(_b);
     const m = ml.add(mr).multiplyScalar(0.5);
-    root.position.set(midShI.x - m.x, midShI.y - m.y + opts.offset * shoulderPx, -m.z);
+    const lift = opts.offset * shoulderPx;
+    root.position.set(midShI.x - m.x, midShI.y - m.y + lift, -m.z);
     root.updateMatrixWorld(true);
+
+    // Limbs: each bone turns toward the next joint where the camera sees it and stretches to reach
+    // it, so the elbows, wrists, knees and ankles land on the person's, however long their arms
+    // and legs are next to the model's. MediaPipe's depth, less sure than the image, only tilts a
+    // bone toward or away from the camera. Joints the camera can't see keep the rest pose.
+    const ppm = this.pxPerMeter;
+    const seen = (i, from, bone, out) => seenAt(img[i], wld[i].z - wld[from].z, bone, ppm, lift, out);
+    for (const [s, lm] of [["l", LM.l], ["r", LM.r]]) {
+      const elbow = vis[lm.el] > 0.3;
+      // A wrist MediaPipe barely sees (out of frame, behind a desk) is a guess, and a hand placed at
+      // it would cut a hole in the garment, so the forearm and hand need a surer wrist.
+      const wrist = elbow && vis[lm.wr] > 0.5;
+      this.reach(B[s + "UpperArm"], B[s + "Forearm"], elbow && seen(lm.el, lm.sh, B[s + "UpperArm"], _t1));
+      this.reach(B[s + "Forearm"], B[s + "Hand"], wrist && seen(lm.wr, lm.el, B[s + "Forearm"], _t1));
+      const tipImg = _t2.addVectors(img[lm.pinky], img[lm.index]).multiplyScalar(0.5);
+      const tipDepth = (wld[lm.pinky].z + wld[lm.index].z) / 2 - wld[lm.wr].z;
+      this.reach(B[s + "Hand"], B[s + "Finger"], wrist && seenAt(tipImg, tipDepth, B[s + "Hand"], ppm, lift, _t1), false);
+      const knee = vis[lm.knee] > 0.5, ankle = knee && vis[lm.ankle] > 0.5;
+      this.reach(B[s + "Thigh"], B[s + "Calf"], knee && seen(lm.knee, lm.hip, B[s + "Thigh"], _t1));
+      this.reach(B[s + "Calf"], B[s + "Foot"], ankle && seen(lm.ankle, lm.knee, B[s + "Calf"], _t1));
+      this.reach(B[s + "Foot"], B[s + "Toe"], ankle && vis[lm.toe] > 0.5 && seen(lm.toe, lm.ankle, B[s + "Foot"], _t1), false);
+    }
   }
 
   // Give `bone` the world rotation `delta * restWorld`, i.e. its rest orientation turned by `delta`.
@@ -704,20 +722,43 @@ class Avatar {
     bone.updateMatrixWorld(true);
   }
 
-  // Rotate `bone` (from its rest pose) so the direction to `child` points from `from` to `to`.
-  aim(bone, child, from, to, enabled) {
+  // Turn `bone` from its rest pose so that `child` points at `target` (a point in the scene), and
+  // with `stretch`, move `child` along the bone so that it reaches it, within REACH. Without a
+  // target, the bone keeps its rest pose and length. The length eases to its new value, so a
+  // joint MediaPipe places unsteadily doesn't make the limb jump.
+  reach(bone, child, target, stretch = true) {
     if (!bone || !child) return;
     bone.quaternion.copy(this.restLocal.get(bone));
+    child.position.copy(this.restPos.get(child));
     bone.updateMatrixWorld(true);
-    if (!enabled) return;
-    const target = _x.subVectors(to, from);
-    if (target.lengthSq() < 1e-8) return;
-    const qWorld = bone.getWorldQuaternion(_qa);
-    const current = _y.copy(child.position).normalize().applyQuaternion(qWorld);
-    _qb.setFromUnitVectors(current, target.normalize());
-    qWorld.premultiply(_qb);
-    bone.parent.getWorldQuaternion(_qc);
-    bone.quaternion.copy(_qc.invert().multiply(qWorld));
+    let k = 1;
+    if (target) {
+      const from = bone.getWorldPosition(_a);
+      const want = _x.subVectors(target, from), distance = want.length();
+      if (distance > 1e-6) {
+        const qWorld = bone.getWorldQuaternion(_qa);
+        const current = _y.copy(child.position).normalize().applyQuaternion(qWorld);
+        _qb.setFromUnitVectors(current, want.divideScalar(distance));
+        qWorld.premultiply(_qb);
+        bone.parent.getWorldQuaternion(_qc);
+        bone.quaternion.copy(_qc.invert().multiply(qWorld));
+        if (stretch) k = THREE.MathUtils.clamp(distance / child.getWorldPosition(_b).distanceTo(from), REACH[0], REACH[1]);
+      }
+    }
+    const length = (this.length.get(child) ?? 1) * 0.5 + k * 0.5;
+    this.length.set(child, length);
+    child.position.multiplyScalar(length);
     bone.updateMatrixWorld(true);
   }
+}
+
+// How far a limb bone may be lengthened or shortened to reach the person's joint.
+const REACH = [0.75, 1.4];
+const _t1 = new THREE.Vector3(), _t2 = new THREE.Vector3();
+
+// Where the camera sees a joint, as a point in the scene: at the image point `p` (raised by
+// `lift`), and `depth` meters nearer the camera than the joint of `bone`.
+function seenAt(p, depth, bone, pxPerMeter, lift, out) {
+  bone.getWorldPosition(out);
+  return out.set(p.x, p.y + lift, out.z + depth * pxPerMeter);
 }
