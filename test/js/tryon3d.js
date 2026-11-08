@@ -73,12 +73,14 @@ window.addEventListener("resize", fitView);
 resize(W, H);
 
 // ---------- Outfit ----------
-// Each outfit gets a card, with a thumbnail from assets/ui/. The first one is worn at the start.
+// Only the DENYX garments are offered; each gets a card with a thumbnail from assets/ui/. The
+// first one is worn at the start.
+const CHOICES = OUTFITS.filter(o => o.garment);
 const CARD_TEXT = {
-  denyx_apron: ["Apron", "Denim waist apron"], denyx_badge: ["Badge", "Lanyard & card holder"],
-  denyx_workwear: ["Workwear", "Denim coverall"], male_adult_07: ["Blazer", "Shirt & jeans"],
+  denyx_apron: ["Apron", "Denim waist apron"], denyx_bib_apron: ["Bib apron", "Denim bib apron"],
+  denyx_badge: ["Badge", "Lanyard & card holder"], denyx_workwear: ["Workwear", "Denim coverall"],
 };
-const outfitCards = OUTFITS.map(o => {
+const outfitCards = CHOICES.map(o => {
   const [name, note] = CARD_TEXT[o.id] ?? [o.name, ""];
   const card = document.createElement("button");
   card.className = "outfit";
@@ -115,7 +117,7 @@ async function setOutfit(id) {
     for (const card of outfitCards) { card.disabled = false; card.classList.remove("loading"); }
   }
 }
-const firstOutfit = OUTFITS.some(o => o.id === params.get("outfit")) ? params.get("outfit") : OUTFITS[0].id;
+const firstOutfit = CHOICES.some(o => o.id === params.get("outfit")) ? params.get("outfit") : CHOICES[0].id;
 const avatarReady = setOutfit(firstOutfit).catch(err => {
   console.error(err);
   statusEl.className = "err";
