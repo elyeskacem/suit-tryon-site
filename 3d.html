@@ -183,8 +183,13 @@
     .dock { display: grid; grid-template-columns: 1fr auto 1fr; grid-template-areas: "outfits outfits outfits" ". shutter tools"; gap: 12px; padding-top: 10px; }
     .outfits { justify-self: stretch; }
     .tools { justify-self: start; }
-    .outfit { flex: 1; min-width: 0; padding-right: 10px; }
-    .outfit small { overflow: hidden; text-overflow: ellipsis; }
+    /* Four cards share the row: thumbnail over the name, no description. */
+    .outfits { gap: 8px; }
+    .outfit { flex: 1; min-width: 0; flex-direction: column; gap: 5px; padding: 7px 4px 8px; text-align: center; }
+    .outfit > span + span { width: 100%; }
+    .thumb { width: 46px; height: 46px; }
+    .outfit b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .outfit small { display: none; }
     .shutter { width: 62px; height: 62px; }
     .shutter::before { width: 46px; height: 46px; }
     .drawer {
@@ -225,7 +230,7 @@
     <div class="welcome">
       <span class="eyebrow">DENYX workwear</span>
       <h2>Try it on, live.</h2>
-      <p class="lead">Pick the apron or the badge below, then step in front of your camera.</p>
+      <p class="lead">Pick an outfit below, then step in front of your camera.</p>
       <ul class="tips">
         <li>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18M6 9l-3 3 3 3M18 9l3 3-3 3"/></svg>

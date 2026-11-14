@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { clone as cloneSkinned } from "three/addons/utils/SkeletonUtils.js";
 
 // An outfit is either a Rocketbox avatar folder (model.fbx + body_color/normal/roughness textures)
 // or a static .glb garment. Garments are fitted in Blender (blender/denyx_garments.blend) to
@@ -10,8 +11,10 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // with a `bone` rides on that bone rigidly; any other bends with the body under it.
 export const OUTFITS = [
   { id: "male_adult_07", name: "Grey blazer, shirt & jeans", path: "assets/avatars/male_adult_07/" },
-  { id: "denyx_apron", name: "DENYX apron", garment: "assets/garments/denyx_apron.glb" },
+  { id: "denyx_apron", name: "DENYX waist apron", garment: "assets/garments/denyx_apron.glb" },
+  { id: "denyx_bib_apron", name: "DENYX bib apron", garment: "assets/garments/denyx_bib_apron.glb" },
   { id: "denyx_badge", name: "DENYX lanyard badge", garment: "assets/garments/denyx_badge.glb", bone: "spine2" },
+  { id: "denyx_workwear", name: "DENYX workwear coverall", garment: "assets/garments/denyx_workwear.glb" },
 ];
 const AVATAR = "assets/avatars/male_adult_07/";
 const GARMENT_BODY = "assets/garments/body.glb";
@@ -42,7 +45,7 @@ const LM = {
 export async function loadAvatar(outfit, { envMap = null } = {}) {
   if (!outfit.garment) {
     const { root, meshes } = await loadRocketbox(outfit.path, { textured: true, occlude: HIDDEN_BONES, envMap });
-    return new Avatar(root, meshes[0].skeleton);
+    return new Avatar(root, meshes[0].skeleton.bones);
   }
   const gltf = new GLTFLoader();
   const [{ root, meshes }, garment, body] = await Promise.all([
@@ -50,7 +53,7 @@ export async function loadAvatar(outfit, { envMap = null } = {}) {
     gltf.loadAsync(outfit.garment),
     gltf.loadAsync(GARMENT_BODY),
   ]);
-  const avatar = new Avatar(root, meshes[0].skeleton);
+  const avatar = new Avatar(root, meshes[0].skeleton.bones);
   const skeleton = new THREE.Skeleton(meshes[0].skeleton.bones);   // bound in the rest pose
   const nearest = nearestWeights(bodyVertices(meshes), 0.04 * BODY_UNITS_PER_METER);
   dress(avatar, skeleton, body.scene, nearest, { body: true });
@@ -152,11 +155,12 @@ function dress(avatar, skeleton, scene, weightsAt, { body = false, envMap = null
     const geometry = part.geometry.clone().applyMatrix4(toBody.clone().multiply(part.matrixWorld));
     // body.glb has no normals (it was only an occluder), but shadow lookups need them.
     if (!geometry.attributes.normal) geometry.computeVertexNormals();
-    // The view is mirrored, so prints are too, or they would read backwards.
-    if (!body && part.material.map) mirrorPrint(geometry);
+    // The view is mirrored, so prints are too, or they would read backwards. A woven fabric's
+    // own texture is cloth, not a print, so it isn't flipped.
+    if (!body && part.material.map && !WOVEN.test(part.material.name)) mirrorPrint(geometry);
     setSkin(geometry, weightsAt);
     const meshes = body ? [new THREE.SkinnedMesh(geometry, OCCLUDER), new THREE.SkinnedMesh(geometry, SHADOW)]
-      : [new THREE.SkinnedMesh(geometry, garmentMaterial(part.material, envMap, uvPerCm(geometry)))];
+      : [new THREE.SkinnedMesh(geometry, garmentMaterial(part.material, envMap, geometry))];
     for (const mesh of meshes) {
       mesh.name = part.name;
       mesh.bind(skeleton, new THREE.Matrix4());
@@ -175,31 +179,29 @@ function dress(avatar, skeleton, scene, weightsAt, { body = false, envMap = null
 // The models' materials suit a 3D viewer; over a camera image they looked like glossy plastic.
 // So each is remade as what it is: fabric, print and card are matte (rough, with a faint
 // specular and a soft sheen at grazing angles, and no studio reflections), metal is brushed and
-// glass reflects a little. Woven fabric (by material name) gets a fabric texture, and everything
-// gets the camera's grain (FILM), so the garment isn't cleaner than the video around it.
+// glass reflects a little. Woven fabric (by material name) is made to look like denim (see
+// below), and everything gets the camera's grain (FILM), so the garment isn't cleaner than the
+// video around it.
 const WOVEN = /denim|fabric|cloth|cotton|canvas|ribbon|webbing/i;
 export const FILM = { time: { value: 0 }, grain: { value: 0.012 } };
 
-function garmentMaterial(m, envMap, uvScale) {
+// Denim needs the part's geometry: its UVs size the weave, and it gets an aEdge attribute.
+function garmentMaterial(m, envMap, geometry) {
   const base = { name: m.name, color: m.color, map: m.map, side: m.side, transparent: m.transparent,
     opacity: m.opacity, alphaTest: m.alphaTest, depthWrite: m.depthWrite };
-  let out;
+  let out, denim = null;
   if (m.metalness > 0.5) {
     out = new THREE.MeshStandardMaterial({ ...base, metalness: 1, roughness: Math.max(m.roughness, 0.5), envMap, envMapIntensity: 0.5 });
   } else if (m.transparent && !m.map) {
     out = new THREE.MeshStandardMaterial({ ...base, metalness: 0, roughness: 0.2, envMap, envMapIntensity: 0.3 });
   } else {
+    const woven = WOVEN.test(m.name);
+    // Woven fabric with its own color texture (a scanned denim) is tinted by that texture's color.
+    const tint = woven && m.map ? meanColor(m.map).multiply(m.color) : m.color;
     out = new THREE.MeshPhysicalMaterial({ ...base, metalness: 0, roughness: 0.95, specularIntensity: 0.3,
-      sheen: 1, sheenRoughness: 0.75, sheenColor: m.color.clone().lerp(new THREE.Color(1, 1, 1), 0.25).multiplyScalar(0.35) });
-    if (WOVEN.test(m.name) && !m.map && uvScale > 0) {
-      const { shade, bumps, mean } = fabricTextures();
-      const repeat = 1 / (FABRIC_TILE_CM * uvScale);
-      out.color.multiplyScalar(1 / mean);
-      out.map = shade.clone();
-      out.normalMap = bumps.clone();
-      for (const t of [out.map, out.normalMap]) t.repeat.set(repeat, repeat);
-      out.normalScale.set(0.6, 0.6);
-    }
+      sheen: 1, sheenRoughness: 0.75, sheenColor: tint.clone().lerp(new THREE.Color(1, 1, 1), 0.25).multiplyScalar(0.35) });
+    const uvScale = uvPerCm(geometry);
+    if (woven && uvScale > 0) denim = makeDenim(out, tint, geometry, uvScale);
   }
   out.onBeforeCompile = shader => {
     shader.uniforms.filmTime = FILM.time;
@@ -208,9 +210,23 @@ function garmentMaterial(m, envMap, uvScale) {
       .replace("void main() {", "uniform float filmTime;\nuniform float filmGrain;\nvoid main() {")
       .replace("#include <dithering_fragment>", `#include <dithering_fragment>
         gl_FragColor.rgb += (fract(sin(dot(gl_FragCoord.xy + filmTime, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) * filmGrain;`);
+    if (denim) denim(shader);
   };
-  out.customProgramCacheKey = () => "film";
+  out.customProgramCacheKey = () => denim ? "film-denim" : "film";
   return out;
+}
+
+// A texture's average color (linear), from a tiny copy of its image.
+function meanColor(texture) {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 16;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(texture.image, 0, 0, 16, 16);
+  const px = ctx.getImageData(0, 0, 16, 16).data;
+  let r = 0, g = 0, b = 0;
+  for (let i = 0; i < px.length; i += 4) { r += px[i]; g += px[i + 1]; b += px[i + 2]; }
+  const n = (px.length / 4) * 255;
+  return new THREE.Color().setRGB(r / n, g / n, b / n, THREE.SRGBColorSpace);
 }
 
 // UV units per centimeter of the surface, from the mesh's triangles.
@@ -230,72 +246,251 @@ function uvPerCm(geometry) {
   return area > 0 ? Math.sqrt(uvArea / area) : 0;
 }
 
-// A tileable woven texture, made once: a color multiplier (soft mottle, lengthwise streaks, a
-// faint twill) and a normal map (the twill's ribs and a gentle unevenness). One tile is
-// FABRIC_TILE_CM of fabric.
-const FABRIC_TILE_CM = 10;
-let fabric = null;
-function fabricTextures() {
-  if (fabric) return fabric;
-  const N = 512;
-  let seed = 7;
-  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
-  const smooth = t => t * t * (3 - 2 * t);
-  // Tileable value noise with cx by cy cells.
-  const noise = (cx, cy) => {
-    const g = Array.from({ length: cx * cy }, rnd);
-    return (x, y) => {
-      const fx = x / N * cx, fy = y / N * cy, x0 = Math.floor(fx), y0 = Math.floor(fy);
-      const tx = smooth(fx - x0), ty = smooth(fy - y0);
-      const at = (i, j) => g[(j % cy) * cx + (i % cx)];
-      const top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
-      const bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
-      return top + (bottom - top) * ty - 0.5;
-    };
+// ---------- Denim ----------
+// Denim is a twill of indigo warp over white weft. Up close it is a diagonal rib flecked with
+// white; from further away a heathered, streaky indigo, paler where it wears along hems, pocket
+// edges and seams. So a denim material gets:
+// - a woven color texture and normal map, tiled at real size from the part's UVs (DENIM_TILE_CM
+//   of cloth per tile): warp, weft showing through the twill, streaks where the yarn's dye
+//   varies, heathered flecks. A material with its own color texture (the apron's denim, taken
+//   from a scan of the real one) keeps it, tiled by its own UVs, and gets only the normal map;
+// - wear along the cloth's edges: each vertex knows its distance along the cloth to the nearest
+//   edge (aEdge, in cm), and the shader fades a band WORN_BAND_CM wide (narrower on straps),
+//   unevenly;
+// - a slow mottle from 3D noise of the rest position, which doesn't repeat with the texture.
+const DENIM_TILE_CM = 10;
+const WORN_BAND_CM = 0.45;
+const WEFT = new THREE.Color(0.7, 0.72, 0.76);    // undyed cotton, linear
+
+function makeDenim(material, color, geometry, uvScale) {
+  const repeat = 1 / (DENIM_TILE_CM * uvScale);
+  if (material.map) {
+    material.map.anisotropy = 8;
+  } else {
+    material.map = denimColor(color).clone();
+    material.map.repeat.set(repeat, repeat);
+  }
+  material.normalMap = denimBumps().clone();
+  material.normalMap.repeat.set(repeat, repeat);
+  material.normalScale.set(0.9, 0.9);
+  material.color.set(0xffffff);               // the color is in the texture
+  geometry.setAttribute("aEdge", new THREE.BufferAttribute(edgeDistances(geometry), 1));
+  const worn = color.clone().lerp(WEFT, 0.45);   // faded indigo
+  return shader => {
+    shader.uniforms.denimWorn = { value: worn };
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute float aEdge;\nvarying float vEdge;\nvarying vec3 vRest;")
+      .replace("#include <begin_vertex>", "#include <begin_vertex>\nvEdge = aEdge;\nvRest = position;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", `#include <common>
+        varying float vEdge;
+        varying vec3 vRest;
+        uniform vec3 denimWorn;
+        float denimHash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+        float denimNoise(vec3 x) {
+          vec3 i = floor(x), f = fract(x);
+          f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(mix(denimHash(i), denimHash(i + vec3(1, 0, 0)), f.x), mix(denimHash(i + vec3(0, 1, 0)), denimHash(i + vec3(1, 1, 0)), f.x), f.y),
+                     mix(mix(denimHash(i + vec3(0, 0, 1)), denimHash(i + vec3(1, 0, 1)), f.x), mix(denimHash(i + vec3(0, 1, 1)), denimHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+        }`)
+      .replace("#include <map_fragment>", `#include <map_fragment>
+        // A slow mottle (the rest position is in cm), then wear along the cloth's edges.
+        diffuseColor.rgb *= 0.84 + 0.32 * (0.6 * denimNoise(vRest / 11.0) + 0.4 * denimNoise(vRest / 3.7));
+        float worn = (1.0 - smoothstep(0.05, ${WORN_BAND_CM.toFixed(2)}, vEdge)) * (0.45 + 0.55 * denimNoise(vRest * 2.3 + 7.0));
+        diffuseColor.rgb = mix(diffuseColor.rgb, denimWorn, 0.8 * worn);`);
   };
-  const mottle = noise(8, 8), fine = noise(32, 32), streaks = noise(96, 4), undulate = noise(3, 3);
-  const shadeData = new Uint8Array(N * N * 4), height = new Float32Array(N * N);
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      const twill = Math.sin(2 * Math.PI * (x + y) / 5);
-      const i = y * N + x;
-      height[i] = 0.25 * twill + 0.6 * streaks(x, y) + 3 * undulate(x, y);
-      const v = 1 + 0.08 * mottle(x, y) + 0.04 * fine(x, y) + 0.06 * streaks(x, y) + 0.02 * twill + 0.02 * (rnd() - 0.5);
-      shadeData.fill(Math.round(THREE.MathUtils.clamp(v * 220, 0, 255)), i * 4, i * 4 + 3);
-      shadeData[i * 4 + 3] = 255;
+}
+
+// Distance in cm along the cloth from each vertex to its nearest edge: mesh edges with a face on
+// one side only, which are the hems of panels, pockets and straps (and seams, where the mesh is
+// split). Stretched on narrow pieces, see below.
+function edgeDistances(geometry) {
+  const { position: pos, normal } = geometry.attributes;
+  // The export splits vertices wherever the normal jumps, sometimes on every face, so first weld
+  // vertices that share a position and roughly a normal: only real edges of the cloth, where its
+  // face turns sharply into its thickness, stay open.
+  const weld = new Int32Array(pos.count), groups = new Map(), normals = [];
+  const N = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    const key = `${Math.round(pos.getX(i) * 200)},${Math.round(pos.getY(i) * 200)},${Math.round(pos.getZ(i) * 200)}`;
+    N.fromBufferAttribute(normal, i);
+    const near = groups.get(key) ?? [];
+    let id = near.find(j => normals[j].dot(N) > 0.75);
+    if (id === undefined) {
+      id = normals.length;
+      normals.push(N.clone());
+      near.push(id);
+      groups.set(key, near);
+    }
+    weld[i] = id;
+  }
+  const n = normals.length, at = new Int32Array(n);
+  for (let i = 0; i < pos.count; i++) at[weld[i]] = i;
+  const raw = geometry.index ? geometry.index.array : Array.from({ length: pos.count }, (_, i) => i);
+  const index = Array.from(raw, i => weld[i]);
+  const uses = new Map(), edges = [];
+  for (let t = 0; t < index.length; t += 3) {
+    for (let k = 0; k < 3; k++) {
+      const a = Math.min(index[t + k], index[t + (k + 1) % 3]), b = Math.max(index[t + k], index[t + (k + 1) % 3]);
+      if (a === b) continue;
+      const key = a * n + b, c = uses.get(key);
+      if (c === undefined) edges.push(a, b);
+      uses.set(key, (c ?? 0) + 1);
     }
   }
-  // The multiplier averages below 1 (sRGB 220 leaves room above), so the material's color is
-  // divided by its mean.
-  const linear = Array.from({ length: 256 }, (_, v) => new THREE.Color().setRGB(v / 255, 0, 0, THREE.SRGBColorSpace).r);
-  let sum = 0;
-  for (let i = 0; i < shadeData.length; i += 4) sum += linear[shadeData[i]];
-  const mean = sum / (N * N);
-  const bumpData = new Uint8Array(N * N * 4);
+  const links = Array.from({ length: n }, () => []);
+  const dist = new Float32Array(n).fill(Infinity);
+  const A = new THREE.Vector3(), B = new THREE.Vector3();
+  for (let e = 0; e < edges.length; e += 2) {
+    const a = edges[e], b = edges[e + 1];
+    const d = A.fromBufferAttribute(pos, at[a]).distanceTo(B.fromBufferAttribute(pos, at[b]));
+    links[a].push(b, d);
+    links[b].push(a, d);
+    if (uses.get(a * n + b) === 1) dist[a] = dist[b] = 0;
+  }
+  // Dijkstra from all edge vertices at once, with a binary heap of [distance, vertex].
+  const heap = [];
+  const push = item => {
+    heap.push(item);
+    for (let i = heap.length - 1; i > 0;) {
+      const up = (i - 1) >> 1;
+      if (heap[up][0] <= heap[i][0]) break;
+      [heap[up], heap[i]] = [heap[i], heap[up]];
+      i = up;
+    }
+  };
+  const pop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]];
+        i = m;
+      }
+    }
+    return top;
+  };
+  for (let i = 0; i < n; i++) if (dist[i] === 0) push([0, i]);
+  while (heap.length) {
+    const [d, v] = pop();
+    if (d > dist[v]) continue;
+    const near = links[v];
+    for (let k = 0; k < near.length; k += 2) {
+      const w = near[k], nd = d + near[k + 1];
+      if (nd < dist[w]) {
+        dist[w] = nd;
+        push([nd, w]);
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) if (dist[i] === Infinity) dist[i] = 100;    // a closed surface
+  // A narrow piece would be worn across most of its width, so on each piece of cloth the
+  // distances are stretched to keep the worn band within a quarter of its half-width. A piece
+  // with no vertex inside it (a strap one face wide, like the lanyard's) can't show a band at
+  // all, so it isn't worn.
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const root = i => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
+  for (let e = 0; e < edges.length; e += 2) parent[root(edges[e])] = root(edges[e + 1]);
+  const widest = new Map();
+  for (let i = 0; i < n; i++) if (dist[i] < 100) widest.set(root(i), Math.max(widest.get(root(i)) ?? 0, dist[i]));
+  for (let i = 0; i < n; i++) {
+    const w = widest.get(root(i)) ?? 0;
+    dist[i] = w > 0 ? dist[i] * Math.max(1, WORN_BAND_CM / (0.25 * w)) : 100;
+  }
+  return Float32Array.from(weld, id => dist[id]);
+}
+
+// Tileable value noise over an N by N texture, with cx by cy cells, in -0.5..0.5.
+function tileNoise(N, cx, cy, rnd) {
+  const g = Array.from({ length: cx * cy }, rnd);
+  const smooth = t => t * t * (3 - 2 * t);
+  return (x, y) => {
+    const fx = x / N * cx, fy = y / N * cy, x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const tx = smooth(fx - x0), ty = smooth(fy - y0);
+    const at = (i, j) => g[(j % cy) * cx + (i % cx)];
+    const top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+    const bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+    return top + (bottom - top) * ty - 0.5;
+  };
+}
+
+const DENIM_N = 512;
+const seeded = seed => () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+// The twill's ribs run up to the right, about 63 degrees from horizontal, 0.8 mm apart.
+const twillAt = (x, y) => 0.5 + 0.5 * Math.sin(2 * Math.PI * (2 * x + y) / 9);
+
+// The woven color for a denim of this (indigo) color, made once per color.
+const denimColors = new Map();
+function denimColor(color) {
+  const key = color.getHexString();
+  if (denimColors.has(key)) return denimColors.get(key);
+  const N = DENIM_N, rnd = seeded(11);
+  const warpEnds = tileNoise(N, 170, 7, rnd), slubs = tileNoise(N, 48, 9, rnd), mottle = tileNoise(N, 6, 6, rnd);
+  // Linear to sRGB bytes.
+  const toByte = Array.from({ length: 4096 }, (_, i) => { const c = i / 4095; return Math.round(255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055)); });
+  const data = new Uint8Array(N * N * 4);
   for (let y = 0; y < N; y++) {
     for (let x = 0; x < N; x++) {
-      const h = (i, j) => height[((j + N) % N) * N + ((i + N) % N)];
+      // Indigo varies by warp end (thin streaks) and along slubs (thicker stretches of yarn).
+      const dye = 1 + 0.45 * warpEnds(x, y) + 0.4 * slubs(x, y) + 0.2 * mottle(x, y) + 0.12 * (rnd() - 0.5);
+      // The weft shows between the warp floats, more where the twill rib dips, and in the odd nep.
+      let weft = 0.24 * Math.max(0, twillAt(x, y) - 0.45) / 0.55;
+      if (rnd() < 0.004) weft = 0.6;
+      const i = (y * N + x) * 4;
+      for (let k = 0; k < 3; k++) {
+        const warp = [color.r, color.g, color.b][k] * Math.max(0.2, dye);
+        const c = warp + ([WEFT.r, WEFT.g, WEFT.b][k] - warp) * weft;
+        data[i + k] = toByte[Math.min(4095, Math.max(0, Math.round(c * 4095)))];
+      }
+      data[i + 3] = 255;
+    }
+  }
+  const texture = repeatingTexture(data, N);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  denimColors.set(key, texture);
+  return texture;
+}
+
+// The weave's relief, made once: the twill's ribs, the warp ends, slubs and a gentle unevenness.
+let denimRelief = null;
+function denimBumps() {
+  if (denimRelief) return denimRelief;
+  const N = DENIM_N, rnd = seeded(7);
+  const warpEnds = tileNoise(N, 170, 7, rnd), slubs = tileNoise(N, 48, 9, rnd), undulate = tileNoise(N, 3, 3, rnd);
+  const height = new Float32Array(N * N);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) height[y * N + x] = 0.5 * twillAt(x, y) + 0.5 * warpEnds(x, y) + 0.8 * slubs(x, y) + 3 * undulate(x, y);
+  }
+  const data = new Uint8Array(N * N * 4);
+  const h = (i, j) => height[((j + N) % N) * N + ((i + N) % N)];
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
       const nx = (h(x - 1, y) - h(x + 1, y)) / 2, ny = (h(x, y - 1) - h(x, y + 1)) / 2, len = Math.hypot(nx, ny, 1);
       const i = (y * N + x) * 4;
-      bumpData[i] = (nx / len * 0.5 + 0.5) * 255;
-      bumpData[i + 1] = (ny / len * 0.5 + 0.5) * 255;
-      bumpData[i + 2] = (1 / len * 0.5 + 0.5) * 255;
-      bumpData[i + 3] = 255;
+      data[i] = (nx / len * 0.5 + 0.5) * 255;
+      data[i + 1] = (ny / len * 0.5 + 0.5) * 255;
+      data[i + 2] = (1 / len * 0.5 + 0.5) * 255;
+      data[i + 3] = 255;
     }
   }
-  const texture = data => {
-    const t = new THREE.DataTexture(data, N, N);
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.magFilter = THREE.LinearFilter;
-    t.minFilter = THREE.LinearMipmapLinearFilter;
-    t.generateMipmaps = true;
-    t.anisotropy = 4;
-    t.needsUpdate = true;
-    return t;
-  };
-  fabric = { shade: texture(shadeData), bumps: texture(bumpData), mean };
-  fabric.shade.colorSpace = THREE.SRGBColorSpace;
-  return fabric;
+  denimRelief = repeatingTexture(data, N);
+  return denimRelief;
+}
+
+function repeatingTexture(data, N) {
+  const t = new THREE.DataTexture(data, N, N);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true;
+  t.anisotropy = 4;
+  t.needsUpdate = true;
+  return t;
 }
 
 // Flip a texture left to right on its part of the model.
@@ -388,17 +583,19 @@ function headFrame(xv, fwd, out) {
 const xyDist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
 class Avatar {
-  constructor(root, skeleton) {
+  constructor(root, bones) {
     this.root = root;
     this.bones = {};
     for (const [key, re] of Object.entries(BONE_PATTERNS)) {
-      this.bones[key] = skeleton.bones.find(b => re.test(b.name)) || null;
+      this.bones[key] = bones.find(b => re.test(b.name)) || null;
       if (!this.bones[key]) console.warn(`Avatar bone not found: ${key}`);
     }
 
     root.updateMatrixWorld(true);
-    this.restLocal = new Map(skeleton.bones.map(b => [b, b.quaternion.clone()]));
-    this.restWorld = new Map(skeleton.bones.map(b => [b, b.getWorldQuaternion(new THREE.Quaternion())]));
+    this.restLocal = new Map(bones.map(b => [b, b.quaternion.clone()]));
+    this.restPos = new Map(bones.map(b => [b, b.position.clone()]));
+    this.length = new Map();      // per bone: how much its parent bone is lengthened (see reach)
+    this.restWorld = new Map(bones.map(b => [b, b.getWorldQuaternion(new THREE.Quaternion())]));
 
     const P = k => this.bones[k].getWorldPosition(new THREE.Vector3());
     const up = P("neck").sub(P("hips"));
@@ -416,6 +613,15 @@ class Avatar {
     this.scale = null;
   }
 
+  // Another person wearing the same outfit: a copy sharing the meshes and materials, with its own
+  // bones. Copy an avatar that hasn't been posed (update() moves its bones).
+  clone() {
+    const root = cloneSkinned(this.root);
+    const bones = [];
+    root.traverse(o => { if (o.isBone) bones.push(o); });
+    return new Avatar(root, bones);
+  }
+
   /**
    * Pose the avatar to match the person.
    * pose.img: Vector3 per landmark in screen space (x right, y up, pixels, unmirrored camera image)
@@ -426,12 +632,16 @@ class Avatar {
     const { img, wld, vis } = pose;
     const B = this.bones, root = this.root;
 
-    // Pixels per meter, from the shoulder line and the torso (robust to turning sideways).
+    // Pixels per meter, from the shoulder line and the torso (robust to turning sideways). With the
+    // hips out of the picture, MediaPipe only guesses where they are in it, so then from the
+    // shoulders alone.
     const midShW = _a.addVectors(wld[11], wld[12]).multiplyScalar(0.5);
     const midHipW = _b.addVectors(wld[23], wld[24]).multiplyScalar(0.5);
     const midShI = new THREE.Vector3().addVectors(img[11], img[12]).multiplyScalar(0.5);
     const midHipI = new THREE.Vector3().addVectors(img[23], img[24]).multiplyScalar(0.5);
-    const k = (xyDist(img[11], img[12]) + xyDist(midShI, midHipI)) / (xyDist(wld[11], wld[12]) + xyDist(midShW, midHipW));
+    const hipsSeen = vis[23] > 0.5 && vis[24] > 0.5;
+    const k = (xyDist(img[11], img[12]) + (hipsSeen ? xyDist(midShI, midHipI) : 0))
+      / (xyDist(wld[11], wld[12]) + (hipsSeen ? xyDist(midShW, midHipW) : 0));
     this.pxPerMeter = this.pxPerMeter == null ? k : this.pxPerMeter + (k - this.pxPerMeter) * 0.2;
     const shoulderPx = this.pxPerMeter * wld[11].distanceTo(wld[12]);
     const torsoPx = this.pxPerMeter * midShW.distanceTo(midHipW);
@@ -443,12 +653,14 @@ class Avatar {
     root.position.set(0, 0, 0);
     root.scale.setScalar(this.scale * opts.fit);
 
-    // Then move the shoulder joints most of the way toward the person's shoulder width
-    // (not all the way, so the jacket still covers the real shoulders).
+    // Then move the shoulder joints toward the person's shoulder width: all the way out for broader
+    // shoulders than the model's, so the garment covers them, and most of the way in for narrower
+    // ones (not all the way, so the jacket still covers the real shoulders).
     const halfDelta = (shoulderPx / this.scale - this.modelShoulder) / 2;
+    const toward = halfDelta > 0 ? 1 : 0.7;
     for (const s of ["l", "r"]) {
       const rest = this.upperArmRest[s], len = rest.length();
-      B[s + "UpperArm"].position.copy(rest).multiplyScalar(THREE.MathUtils.clamp((len + halfDelta * 0.7) / len, 0.5, 1.4));
+      B[s + "UpperArm"].position.copy(rest).multiplyScalar(THREE.MathUtils.clamp((len + halfDelta * toward) / len, 0.5, 1.4));
     }
     root.updateMatrixWorld(true);
 
@@ -470,23 +682,35 @@ class Avatar {
     this.setWorldRotation(B.lClavicle, qChest);
     this.setWorldRotation(B.rClavicle, qChest);
 
-    // Limbs: point each bone at the next joint. Joints the camera can't see keep the rest pose.
-    for (const [s, lm] of [["l", LM.l], ["r", LM.r]]) {
-      const handTip = _a.addVectors(wld[lm.pinky], wld[lm.index]).multiplyScalar(0.5);
-      this.aim(B[s + "UpperArm"], B[s + "Forearm"], wld[lm.sh], wld[lm.el], vis[lm.el] > 0.3);
-      this.aim(B[s + "Forearm"], B[s + "Hand"], wld[lm.el], wld[lm.wr], vis[lm.el] > 0.3 && vis[lm.wr] > 0.3);
-      this.aim(B[s + "Hand"], B[s + "Finger"], wld[lm.wr], handTip, vis[lm.wr] > 0.3);
-      this.aim(B[s + "Thigh"], B[s + "Calf"], wld[lm.hip], wld[lm.knee], vis[lm.knee] > 0.5);
-      this.aim(B[s + "Calf"], B[s + "Foot"], wld[lm.knee], wld[lm.ankle], vis[lm.knee] > 0.5 && vis[lm.ankle] > 0.5);
-      this.aim(B[s + "Foot"], B[s + "Toe"], wld[lm.ankle], wld[lm.toe], vis[lm.ankle] > 0.5 && vis[lm.toe] > 0.5);
-    }
-
     // Place the model so its shoulder joints sit on the person's shoulders.
     root.updateMatrixWorld(true);
     const ml = B.lUpperArm.getWorldPosition(_a), mr = B.rUpperArm.getWorldPosition(_b);
     const m = ml.add(mr).multiplyScalar(0.5);
-    root.position.set(midShI.x - m.x, midShI.y - m.y + opts.offset * shoulderPx, -m.z);
+    const lift = opts.offset * shoulderPx;
+    root.position.set(midShI.x - m.x, midShI.y - m.y + lift, -m.z);
     root.updateMatrixWorld(true);
+
+    // Limbs: each bone turns toward the next joint where the camera sees it and stretches to reach
+    // it, so the elbows, wrists, knees and ankles land on the person's, however long their arms
+    // and legs are next to the model's. MediaPipe's depth, less sure than the image, only tilts a
+    // bone toward or away from the camera. Joints the camera can't see keep the rest pose.
+    const ppm = this.pxPerMeter;
+    const seen = (i, from, bone, out) => seenAt(img[i], wld[i].z - wld[from].z, bone, ppm, lift, out);
+    for (const [s, lm] of [["l", LM.l], ["r", LM.r]]) {
+      const elbow = vis[lm.el] > 0.3;
+      // A wrist MediaPipe barely sees (out of frame, behind a desk) is a guess, and a hand placed at
+      // it would cut a hole in the garment, so the forearm and hand need a surer wrist.
+      const wrist = elbow && vis[lm.wr] > 0.5;
+      this.reach(B[s + "UpperArm"], B[s + "Forearm"], elbow && seen(lm.el, lm.sh, B[s + "UpperArm"], _t1));
+      this.reach(B[s + "Forearm"], B[s + "Hand"], wrist && seen(lm.wr, lm.el, B[s + "Forearm"], _t1));
+      const tipImg = _t2.addVectors(img[lm.pinky], img[lm.index]).multiplyScalar(0.5);
+      const tipDepth = (wld[lm.pinky].z + wld[lm.index].z) / 2 - wld[lm.wr].z;
+      this.reach(B[s + "Hand"], B[s + "Finger"], wrist && seenAt(tipImg, tipDepth, B[s + "Hand"], ppm, lift, _t1), false);
+      const knee = vis[lm.knee] > 0.5, ankle = knee && vis[lm.ankle] > 0.5;
+      this.reach(B[s + "Thigh"], B[s + "Calf"], knee && seen(lm.knee, lm.hip, B[s + "Thigh"], _t1));
+      this.reach(B[s + "Calf"], B[s + "Foot"], ankle && seen(lm.ankle, lm.knee, B[s + "Calf"], _t1));
+      this.reach(B[s + "Foot"], B[s + "Toe"], ankle && vis[lm.toe] > 0.5 && seen(lm.toe, lm.ankle, B[s + "Foot"], _t1), false);
+    }
   }
 
   // Give `bone` the world rotation `delta * restWorld`, i.e. its rest orientation turned by `delta`.
@@ -498,20 +722,43 @@ class Avatar {
     bone.updateMatrixWorld(true);
   }
 
-  // Rotate `bone` (from its rest pose) so the direction to `child` points from `from` to `to`.
-  aim(bone, child, from, to, enabled) {
+  // Turn `bone` from its rest pose so that `child` points at `target` (a point in the scene), and
+  // with `stretch`, move `child` along the bone so that it reaches it, within REACH. Without a
+  // target, the bone keeps its rest pose and length. The length eases to its new value, so a
+  // joint MediaPipe places unsteadily doesn't make the limb jump.
+  reach(bone, child, target, stretch = true) {
     if (!bone || !child) return;
     bone.quaternion.copy(this.restLocal.get(bone));
+    child.position.copy(this.restPos.get(child));
     bone.updateMatrixWorld(true);
-    if (!enabled) return;
-    const target = _x.subVectors(to, from);
-    if (target.lengthSq() < 1e-8) return;
-    const qWorld = bone.getWorldQuaternion(_qa);
-    const current = _y.copy(child.position).normalize().applyQuaternion(qWorld);
-    _qb.setFromUnitVectors(current, target.normalize());
-    qWorld.premultiply(_qb);
-    bone.parent.getWorldQuaternion(_qc);
-    bone.quaternion.copy(_qc.invert().multiply(qWorld));
+    let k = 1;
+    if (target) {
+      const from = bone.getWorldPosition(_a);
+      const want = _x.subVectors(target, from), distance = want.length();
+      if (distance > 1e-6) {
+        const qWorld = bone.getWorldQuaternion(_qa);
+        const current = _y.copy(child.position).normalize().applyQuaternion(qWorld);
+        _qb.setFromUnitVectors(current, want.divideScalar(distance));
+        qWorld.premultiply(_qb);
+        bone.parent.getWorldQuaternion(_qc);
+        bone.quaternion.copy(_qc.invert().multiply(qWorld));
+        if (stretch) k = THREE.MathUtils.clamp(distance / child.getWorldPosition(_b).distanceTo(from), REACH[0], REACH[1]);
+      }
+    }
+    const length = (this.length.get(child) ?? 1) * 0.5 + k * 0.5;
+    this.length.set(child, length);
+    child.position.multiplyScalar(length);
     bone.updateMatrixWorld(true);
   }
+}
+
+// How far a limb bone may be lengthened or shortened to reach the person's joint.
+const REACH = [0.75, 1.4];
+const _t1 = new THREE.Vector3(), _t2 = new THREE.Vector3();
+
+// Where the camera sees a joint, as a point in the scene: at the image point `p` (raised by
+// `lift`), and `depth` meters nearer the camera than the joint of `bone`.
+function seenAt(p, depth, bone, pxPerMeter, lift, out) {
+  bone.getWorldPosition(out);
+  return out.set(p.x, p.y + lift, out.z + depth * pxPerMeter);
 }

@@ -1,5 +1,5 @@
 // Synthetic MediaPipe-style results for testing without a camera: open 3d.html?test=<pose>
-// Poses: down, hips, wave, cross, turn, full
+// Poses: down, hips, wave, cross, flex, turn, full, and group (three people)
 // World points are meters in MediaPipe's convention: x = image right (the person's left), y = down,
 // z = away from the camera, origin between the hips.
 
@@ -19,10 +19,25 @@ const LEFT_ARM = {
   hips: [[0.4, -0.26, 0.06], [0.19, -0.03, -0.07]],
   wave: [[0.42, -0.66, 0.02], [0.45, -0.95, -0.03]],
   cross: [[0.23, -0.24, -0.12], [-0.06, -0.3, -0.26]],
+  // Elbow out and toward the camera, forearm up; the arm is longer than the avatar's.
+  flex: [[0.43, -0.27, -0.12], [0.41, -0.63, -0.2]],
 };
 const SYMMETRIC = new Set(["down", "hips"]);
 
 export function syntheticPose(name, W, H) {
+  if (name === "group") {
+    // Three people: the one in the middle is nearer the camera (bigger) and overlaps the others.
+    const people = [["down", 0.3, 520], ["wave", 0.5, 760], ["hips", 0.7, 520]].map(([arm, cx, px]) => person(arm, W, H, cx * W, px));
+    return { landmarks: people.map(p => p.landmarks), worldLandmarks: people.map(p => p.worldLandmarks) };
+  }
+  const full = name === "full";
+  const p = person(name, W, H, W / 2, full ? 330 : 820, full ? 0.55 * H : null);
+  return { landmarks: [p.landmarks], worldLandmarks: [p.worldLandmarks] };
+}
+
+// One person centered at x = cx pixels, px pixels per meter, hips at hipY pixels (by default, the
+// shoulders at 38% of the height).
+function person(name, W, H, cx, px, hipY = null) {
   const arm = LEFT_ARM[name] ? name : "down";
   const P = {};
   for (const [i, p] of Object.entries(BASE)) P[i] = [...p];
@@ -50,14 +65,12 @@ export function syntheticPose(name, W, H) {
     }
   }
 
-  const full = name === "full";
-  const px = full ? 330 : 820;                  // pixels per meter
-  const hipY = full ? 0.55 * H : 0.38 * H + 0.5 * px;
+  hipY ??= 0.38 * H + 0.5 * px;
   const landmarks = [], worldLandmarks = [];
   for (let i = 0; i < 33; i++) {
     const p = P[i];
-    landmarks.push({ x: (W / 2 + p[0] * px) / W, y: (hipY + p[1] * px) / H, z: p[2], visibility: 0.99 });
+    landmarks.push({ x: (cx + p[0] * px) / W, y: (hipY + p[1] * px) / H, z: p[2], visibility: 0.99 });
     worldLandmarks.push({ x: p[0], y: p[1], z: p[2], visibility: 0.99 });
   }
-  return { landmarks: [landmarks], worldLandmarks: [worldLandmarks] };
+  return { landmarks, worldLandmarks };
 }
